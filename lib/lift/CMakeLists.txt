@@ -173,6 +173,7 @@ add_library(picanha_lift STATIC
     src/trace_manager_impl.cpp
     src/ir_optimizer.cpp
     src/lifting_service.cpp
+    src/export_lift_service.cpp
     ${RELLIC_SOURCES}
 )
 

@@ -340,102 +340,148 @@ void FunctionDetector::build_functions() {
     functions_.resize(candidates_.size());
 
     std::atomic<std::size_t> completed{0};
+    std::atomic<std::size_t> errors{0};
+    std::atomic<std::size_t> timeouts{0};
 
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, candidates_.size()),
-        [this, &completed](const tbb::blocked_range<std::size_t>& range) {
+        [this, &completed, &errors, &timeouts](const tbb::blocked_range<std::size_t>& range) {
             for (std::size_t i = range.begin(); i != range.end(); ++i) {
                 const auto& candidate = candidates_[i];
-
-                // Configure CFG builder with function bounds if available
-                CFGBuilderConfig cfg_config;
-                cfg_config.function_start = candidate.address;
-                if (candidate.end_address != INVALID_ADDRESS) {
-                    cfg_config.function_end = candidate.end_address;
-                }
-
-                CFGBuilder builder(binary_, cfg_config);
-                FunctionId id = static_cast<FunctionId>(i);
-
-                // Progress logging
+                
+                // Progress logging with address for debugging
                 auto done = ++completed;
                 if (done % 100 == 0 || done == candidates_.size()) {
-                    spdlog::info("  CFG progress: {}/{}", done, candidates_.size());
+                    spdlog::info("  CFG progress: {}/{} (current: 0x{:X})", done, candidates_.size(), candidate.address);
+                }
+                
+                // Verbose logging for last 500 functions
+                if (candidates_.size() - done < 500 && (done % 10 == 0)) {
+                    spdlog::debug("  Building CFG for function {} at 0x{:X} (range: {}-{})", 
+                        done, candidate.address, range.begin(), range.end());
                 }
 
-                Function func(id, candidate.address);
-                func.set_name(candidate.name);
-
-                // Set type based on source
-                switch (candidate.source) {
-                    case FunctionSource::Import:
-                        func.set_type(FunctionType::Import);
-                        break;
-                    case FunctionSource::Export:
-                        func.set_type(FunctionType::Export);
-                        break;
-                    default:
-                        func.set_type(FunctionType::Normal);
-                        break;
-                }
-
-                // Build CFG
-                auto cfg = builder.build(candidate.address);
-                if (cfg) {
-                    // Analyze CFG properties
-                    cfg->compute_dominators();
-                    cfg->detect_loops();
-
-                    // Set function flags based on CFG
-                    if (cfg->loop_headers().empty()) {
-                        // No loops - might be leaf if also no calls
-                    } else {
-                        func.set_flag(FunctionFlags::HasLoops);
+                try {
+                    // Log before building for problematic range
+                    if (i >= 5690 && i <= 5790) {
+                        spdlog::info("[HANG-DEBUG] Starting CFG build for function {} at 0x{:X}", i, candidate.address);
+                    }
+                    
+                    // Configure CFG builder with function bounds if available
+                    CFGBuilderConfig cfg_config;
+                    cfg_config.function_start = candidate.address;
+                    if (candidate.end_address != INVALID_ADDRESS) {
+                        cfg_config.function_end = candidate.end_address;
+                    }
+                    
+                    // Reduce limits for the problematic range
+                    if (i >= 5690 && i <= 5790) {
+                        cfg_config.max_instructions = 1000;  // Reduced from 50000
+                        cfg_config.max_blocks = 100;          // Reduced from 10000
+                        spdlog::info("[HANG-DEBUG] Using reduced limits for function {}: max_instructions={}, max_blocks={}",
+                            i, cfg_config.max_instructions, cfg_config.max_blocks);
                     }
 
-                    // Check for leaf function (no calls)
-                    bool has_calls = false;
-                    cfg->for_each_block([&has_calls](const BasicBlock& block) {
-                        if (block.has_call()) {
-                            has_calls = true;
+                    CFGBuilder builder(binary_, cfg_config);
+                    FunctionId id = static_cast<FunctionId>(i);
+
+                    Function func(id, candidate.address);
+                    func.set_name(candidate.name);
+
+                    // Set type based on source
+                    switch (candidate.source) {
+                        case FunctionSource::Import:
+                            func.set_type(FunctionType::Import);
+                            break;
+                        case FunctionSource::Export:
+                            func.set_type(FunctionType::Export);
+                            break;
+                        default:
+                            func.set_type(FunctionType::Normal);
+                            break;
+                    }
+
+                    // Build CFG
+                    spdlog::info("[HANG-DEBUG] Starting build() for function {} at 0x{:X}", i, candidate.address);
+                    auto cfg = builder.build(candidate.address);
+                    spdlog::info("[HANG-DEBUG] Finished build() for function {} at 0x{:X}", i, candidate.address);
+                    
+                    if (i >= 5690 && i <= 5790) {
+                        spdlog::info("[HANG-DEBUG] Finished CFG build for function {} at 0x{:X}, blocks: {}",
+                            i, candidate.address, cfg ? cfg->block_count() : 0);
+                    }
+                    if (cfg) {
+                        // Analyze CFG properties
+                        cfg->compute_dominators();
+                        cfg->detect_loops();
+
+                        // Set function flags based on CFG
+                        if (cfg->loop_headers().empty()) {
+                            // No loops - might be leaf if also no calls
+                        } else {
+                            func.set_flag(FunctionFlags::HasLoops);
                         }
-                    });
 
-                    if (!has_calls) {
-                        func.set_flag(FunctionFlags::IsLeaf);
-                    }
-
-                    // Check for indirect control flow
-                    cfg->for_each_block([&func](const BasicBlock& block) {
-                        if (block.has_indirect()) {
-                            if (block.terminator_type() == FlowType::IndirectCall) {
-                                func.set_flag(FunctionFlags::HasIndirectCalls);
-                            } else if (block.terminator_type() == FlowType::IndirectJump) {
-                                func.set_flag(FunctionFlags::HasIndirectJumps);
+                        // Check for leaf function (no calls)
+                        bool has_calls = false;
+                        cfg->for_each_block([&has_calls](const BasicBlock& block) {
+                            if (block.has_call()) {
+                                has_calls = true;
                             }
+                        });
+
+                        if (!has_calls) {
+                            func.set_flag(FunctionFlags::IsLeaf);
                         }
-                    });
 
-                    func.set_cfg(std::move(*cfg));
+                        // Check for indirect control flow
+                        cfg->for_each_block([&func](const BasicBlock& block) {
+                            if (block.has_indirect()) {
+                                if (block.terminator_type() == FlowType::IndirectCall) {
+                                    func.set_flag(FunctionFlags::HasIndirectCalls);
+                                } else if (block.terminator_type() == FlowType::IndirectJump) {
+                                    func.set_flag(FunctionFlags::HasIndirectJumps);
+                                }
+                            }
+                        });
+
+                        func.set_cfg(std::move(*cfg));
+                    }
+
+                    address_to_function_.insert({candidate.address, id});
+                    functions_[i] = std::move(func);
+
+                    // Update progress
+                    ++progress_counter_;
+                    
+                } catch (const std::exception& e) {
+                    ++errors;
+                    spdlog::error("Error building CFG for function at 0x{:X}: {}", candidate.address, e.what());
                 }
-
-                address_to_function_.insert({candidate.address, id});
-                functions_[i] = std::move(func);
-
-                // Update progress
-                ++progress_counter_;
             }
         }
     );
+    
+    spdlog::info("CFG building complete: {} successful, {} errors", completed.load(), errors.load());
 }
 
 void FunctionDetector::analyze_call_graph() {
+    spdlog::info("Analyzing call graph for {} functions...", functions_.size());
+    
     // For each function, find call targets and link callers/callees
+    std::atomic<std::size_t> processed{0};
+    
     tbb::parallel_for(
         tbb::blocked_range<std::size_t>(0, functions_.size()),
-        [this](const tbb::blocked_range<std::size_t>& range) {
+        [this, &processed](const tbb::blocked_range<std::size_t>& range) {
             for (std::size_t i = range.begin(); i != range.end(); ++i) {
                 auto& func = functions_[i];
+                
+                // Progress logging
+                auto done = ++processed;
+                if (done % 1000 == 0 || done == functions_.size()) {
+                    spdlog::info("  Call graph progress: {}/{}", done, functions_.size());
+                }
 
                 func.cfg().for_each_block([this, &func](const BasicBlock& block) {
                     for (const auto& instr : block.instructions()) {
@@ -456,6 +502,8 @@ void FunctionDetector::analyze_call_graph() {
             }
         }
     );
+    
+    spdlog::info("Building caller lists...");
 
     // Build caller lists from callee lists
     for (auto& func : functions_) {
@@ -465,6 +513,8 @@ void FunctionDetector::analyze_call_graph() {
             }
         }
     }
+    
+    spdlog::info("Call graph analysis complete");
 }
 
 bool FunctionDetector::check_prologue(Address addr) const {

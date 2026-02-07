@@ -110,7 +110,15 @@ void CFGBuilder::decode_function(Address entry) {
 
     std::size_t worklist_iterations = 0;
     constexpr std::size_t max_worklist_iterations = 100000;
-
+    
+    // Track largest worklist size for debugging
+    std::size_t max_worklist_size = 1;
+    Address last_logged_addr = 0;
+    
+    // Track consecutive empty decodes to detect hangs
+    std::size_t consecutive_empty_decodes = 0;
+    constexpr std::size_t max_consecutive_empty = 100;
+    
     // Helper to check if address is within function bounds
     auto is_within_bounds = [this](Address addr) -> bool {
         // If no bounds specified, allow addresses near entry (within ~1MB for safety)
@@ -132,11 +140,23 @@ void CFGBuilder::decode_function(Address entry) {
     while (!worklist.empty()) {
         Address addr = worklist.front();
         worklist.pop();
+        
+        // Track max worklist size
+        if (worklist.size() > max_worklist_size) {
+            max_worklist_size = worklist.size();
+        }
 
         // Safety: limit total worklist iterations to prevent infinite loops
         if (++worklist_iterations > max_worklist_iterations) {
-            spdlog::warn("CFG builder: hit max worklist iterations at 0x{:X}", entry);
+            spdlog::warn("CFG builder: hit max worklist iterations at 0x{:X}, worklist size: {}, max size: {}", 
+                entry, worklist.size(), max_worklist_size);
             break;
+        }
+        
+        // Log progress every 10000 iterations for debugging hangs
+        if (worklist_iterations % 10000 == 0) {
+            spdlog::debug("CFG builder: iteration {} at 0x{:X}, worklist: {}, visited: {}, instructions: {}",
+                worklist_iterations, addr, worklist.size(), visited_.size(), all_instructions_.size());
         }
 
         if (visited_.count(addr)) continue;
@@ -147,8 +167,33 @@ void CFGBuilder::decode_function(Address entry) {
             spdlog::debug("CFG builder: hit max instructions ({}) at 0x{:X}", config_.max_instructions, entry);
             break;
         }
+        
+        // Log every 1000 unique addresses decoded for debugging
+        if (visited_.size() % 1000 == 0 && last_logged_addr != addr) {
+            last_logged_addr = addr;
+            spdlog::debug("CFG builder: decoded {} instructions at 0x{:X}, worklist: {}",
+                visited_.size(), addr, worklist.size());
+        }
 
         auto instructions = decode_block(addr);
+        
+        // Track consecutive empty decodes
+        if (instructions.empty()) {
+            consecutive_empty_decodes++;
+            if (consecutive_empty_decodes >= max_consecutive_empty) {
+                spdlog::warn("CFG builder: breaking due to {} consecutive empty decodes at 0x{:X}",
+                    consecutive_empty_decodes, entry);
+                break;
+            }
+        } else {
+            consecutive_empty_decodes = 0;
+        }
+        
+        // Debug: Log instruction count
+        if (worklist_iterations % 1000 == 0 || instructions.empty()) {
+            spdlog::debug("CFG builder: decoded {} instructions at 0x{:X}, worklist: {} (iter: {})",
+                instructions.size(), addr, worklist.size(), worklist_iterations);
+        }
 
         for (const auto& instr : instructions) {
             if (visited_.count(instr.ip())) continue;
@@ -201,9 +246,13 @@ void CFGBuilder::decode_function(Address entry) {
 
         // Check block limit (estimated from instruction count)
         if (block_starts_.size() > config_.max_blocks) {
+            spdlog::debug("CFG builder: hit max blocks ({}) at 0x{:X}", config_.max_blocks, entry);
             break;
         }
     }
+    
+    spdlog::debug("CFG builder: worklist loop exited at 0x{:X}, iterations: {}, instructions: {}, blocks: {}",
+        entry, worklist_iterations, all_instructions_.size(), block_starts_.size());
 
     // Sort instructions by address
     std::sort(all_instructions_.begin(), all_instructions_.end(),
@@ -222,13 +271,25 @@ void CFGBuilder::decode_function(Address entry) {
 }
 
 std::vector<Instruction> CFGBuilder::decode_block(Address addr) {
-    // Get code from memory
-    auto code = binary_->memory().read(addr, config_.max_block_size);
+    // Get code from memory - limit to smaller size to prevent huge decodes
+    std::size_t read_size = std::min(config_.max_block_size, static_cast<std::size_t>(4096));
+    auto code = binary_->memory().read(addr, read_size);
     if (!code) {
         return {};
     }
+    
+    // Decode with instruction limit per block
+    auto instructions = decoder_.decode_until_terminator(*code, addr);
+    
+    // Safety: if we decoded too many instructions, something might be wrong
+    constexpr std::size_t max_block_instructions = 1000;
+    if (instructions.size() > max_block_instructions) {
+        spdlog::warn("CFG builder: block at 0x{:X} has {} instructions, truncating to {}", 
+            addr, instructions.size(), max_block_instructions);
+        instructions.resize(max_block_instructions);
+    }
 
-    return decoder_.decode_until_terminator(*code, addr);
+    return instructions;
 }
 
 void CFGBuilder::create_blocks() {

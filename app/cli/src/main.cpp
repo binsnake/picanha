@@ -17,6 +17,7 @@
 #ifdef PICANHA_ENABLE_LLVM
 #include <picanha/lift/lifting_service.hpp>
 #include <picanha/lift/lifted_function.hpp>
+#include <picanha/lift/export_lift_service.hpp>
 #ifdef PICANHA_ENABLE_DECOMPILER
 #include <picanha/lift/decompilation_service.hpp>
 #endif
@@ -46,6 +47,10 @@ int cmd_sections(const std::string& binary_path);
 int cmd_cfg(const std::string& binary_path, Address func_addr);
 #ifdef PICANHA_ENABLE_LLVM
 int cmd_lift(const std::string& binary_path, Address addr, int opt_level, const std::string& output_file);
+int cmd_export_lift(const std::string& binary_path, Address addr, int opt_level, 
+                    bool with_deps, bool with_data, bool auto_compile,
+                    const std::string& output_file, const std::string& data_output_file,
+                    const std::string& entry_point, const std::string& remill_lib_path);
 #ifdef PICANHA_ENABLE_DECOMPILER
 int cmd_decompile(const std::string& binary_path, Address addr, const std::string& output_file);
 #endif
@@ -99,7 +104,7 @@ int main(int argc, char** argv) {
     bool analyze_verbose = false;
     analyze_cmd->add_option("binary", analyze_binary, "Path to binary file")->required()->check(CLI::ExistingFile);
     analyze_cmd->add_option("-o,--output", analyze_output, "Output project file (.pdb)");
-    analyze_cmd->add_flag("--verbose", analyze_verbose, "Verbose analysis output");
+    analyze_cmd->add_flag("-v,--verbose", analyze_verbose, "Verbose analysis output");
 
     // Functions command
     auto* functions_cmd = app.add_subcommand("functions", "List detected functions");
@@ -139,6 +144,29 @@ int main(int argc, char** argv) {
     lift_cmd->add_option("address", lift_addr_str, "Function address (hex)")->required();
     lift_cmd->add_option("-O,--opt-level", lift_opt_level, "Optimization level (0-3)")->default_val(0)->check(CLI::Range(0, 3));
     lift_cmd->add_option("-o,--output", lift_output, "Output file for IR");
+
+    // Export lift command - produces compile-ready IR with remill runtime
+    auto* export_lift_cmd = app.add_subcommand("export-lift", "Export function as compile-ready LLVM IR");
+    std::string export_lift_binary;
+    std::string export_lift_addr_str;
+    int export_lift_opt_level = 0;
+    bool export_lift_with_deps = false;
+    bool export_lift_with_data = false;
+    bool export_lift_auto_compile = false;
+    std::string export_lift_output;
+    std::string export_lift_data_output;
+    std::string export_lift_entry_point;
+    std::string export_lift_remill_lib;
+    export_lift_cmd->add_option("binary", export_lift_binary, "Path to binary file")->required()->check(CLI::ExistingFile);
+    export_lift_cmd->add_option("address", export_lift_addr_str, "Function address (hex)")->required();
+    export_lift_cmd->add_option("-O,--opt-level", export_lift_opt_level, "Optimization level (0-3)")->default_val(0)->check(CLI::Range(0, 3));
+    export_lift_cmd->add_flag("-d,--with-deps", export_lift_with_deps, "Include lifted dependencies");
+    export_lift_cmd->add_flag("--with-data", export_lift_with_data, "Include data sections in separate file");
+    export_lift_cmd->add_option("-o,--output", export_lift_output, "Output file for IR (required)")->required();
+    export_lift_cmd->add_option("--data-output", export_lift_data_output, "Output file for data sections (with --with-data)");
+    export_lift_cmd->add_option("--entry-point", export_lift_entry_point, "Entry point symbol name for linking (defaults to lifted function name)");
+    export_lift_cmd->add_flag("--compile", export_lift_auto_compile, "Automatically compile and link the output");
+    export_lift_cmd->add_option("--remill-lib", export_lift_remill_lib, "Path to remill runtime library (.lib file) for linking");
 
 #ifdef PICANHA_ENABLE_DECOMPILER
     // Decompile command
@@ -185,6 +213,13 @@ int main(int argc, char** argv) {
     else if (*lift_cmd) {
         Address addr = std::stoull(lift_addr_str, nullptr, 16);
         return cmd_lift(lift_binary, addr, lift_opt_level, lift_output);
+    }
+    else if (*export_lift_cmd) {
+        Address addr = std::stoull(export_lift_addr_str, nullptr, 16);
+        return cmd_export_lift(export_lift_binary, addr, export_lift_opt_level, 
+                               export_lift_with_deps, export_lift_with_data, export_lift_auto_compile,
+                               export_lift_output, export_lift_data_output,
+                               export_lift_entry_point, export_lift_remill_lib);
     }
 #ifdef PICANHA_ENABLE_DECOMPILER
     else if (*decompile_cmd) {
@@ -359,36 +394,42 @@ int cmd_analyze(const std::string& binary_path, const std::string& output_path, 
     auto start_time = std::chrono::high_resolution_clock::now();
 
     spdlog::info("Starting analysis of {}", fs::path(binary_path).filename().string());
+    
+    // Set verbose logging if requested
+    if (verbose) {
+        spdlog::set_level(spdlog::level::debug);
+        spdlog::debug("Verbose logging enabled");
+    }
 
     // Create analysis context
     auto context = std::make_shared<disasm::DisassemblyContext>(binary);
     analysis::SymbolTable symbols;
     analysis::XRefManager xrefs;
 
-    // Detect functions
+    // Detect functions (this also builds CFGs)
     spdlog::info("Detecting functions...");
-    analysis::FunctionDetector detector(binary, context);
-    detector.detect();
+    analysis::FunctionDetectorConfig detector_config;
+    detector_config.build_cfg = true;
+    detector_config.analyze_calls = true;
+    analysis::FunctionDetector detector(binary, context, detector_config);
+    
+    // Detect with progress callback
+    detector.detect([](std::size_t current, std::size_t total, const char* phase) {
+        spdlog::info("Analysis phase {}/{}: {}", current, total, phase);
+    });
 
     auto& functions = detector.functions();
     spdlog::info("Found {} functions", functions.size());
 
-    // Build CFGs for each function
-    if (verbose) {
-        spdlog::info("Building control flow graphs...");
-    }
-
-    analysis::CFGBuilder cfg_builder(binary);
+    // Count total blocks from already-built CFGs
     std::size_t total_blocks = 0;
-
     for (auto& func : functions) {
-        auto cfg = cfg_builder.build(func.start_address());
-        if (cfg) {
-            total_blocks += cfg->block_count();
+        if (func.cfg().block_count() > 0) {
+            total_blocks += func.cfg().block_count();
         }
     }
 
-    spdlog::info("Built {} basic blocks across all functions", total_blocks);
+    spdlog::info("Total basic blocks: {}", total_blocks);
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -661,6 +702,147 @@ int cmd_lift(const std::string& binary_path, Address addr, int opt_level, const 
             std::cout << std::string(60, '-') << "\n";
             std::cout << ir << "\n";
         }
+    }
+
+    return 0;
+}
+
+int cmd_export_lift(const std::string& binary_path, Address addr, int opt_level, 
+                    bool with_deps, bool with_data, bool auto_compile,
+                    const std::string& output_file, const std::string& data_output_file,
+                    const std::string& entry_point, const std::string& remill_lib_path) {
+    auto binary = load_binary(binary_path);
+    if (!binary) return 1;
+
+    std::cout << std::format("Exporting lifted function at 0x{:X}...\n", addr);
+    std::cout << "Configuration:\n";
+    std::cout << std::format("  Optimization level: O{}\n", opt_level);
+    std::cout << std::format("  Include dependencies: {}\n", with_deps ? "yes" : "no");
+    std::cout << std::format("  Include data sections: {}\n", with_data ? "yes" : "no");
+    std::cout << std::format("  Auto-compile: {}\n", auto_compile ? "yes" : "no");
+    if (!entry_point.empty()) {
+        std::cout << std::format("  Entry point: {}\n", entry_point);
+    }
+    if (!remill_lib_path.empty()) {
+        std::cout << std::format("  Remill library: {}\n", remill_lib_path);
+    }
+
+    // Create export lift service
+    lift::ExportLiftService service(binary);
+    if (!service.initialize()) {
+        std::cerr << "Failed to initialize export lift service: " << service.error_message() << "\n";
+        return 1;
+    }
+
+    // Configure export
+    lift::ExportLiftConfig config;
+    config.opt_level = static_cast<lift::OptimizationLevel>(opt_level);
+    config.include_dependencies = with_deps;
+    config.include_data_sections = with_data;
+    config.entry_point_name = entry_point;
+    config.auto_compile = auto_compile;
+    config.remill_lib_path = remill_lib_path;
+
+    // Export the function
+    auto result = service.export_function(addr, config);
+    
+    if (!result.success) {
+        std::cerr << "Failed to export function: " << result.error_message << "\n";
+        return 1;
+    }
+
+    std::cout << "Export successful!\n\n";
+
+    // Write main IR to file
+    {
+        std::ofstream out(output_file);
+        if (!out) {
+            std::cerr << "Failed to open output file: " << output_file << "\n";
+            return 1;
+        }
+        out << result.code_ir;
+        std::cout << std::format("Main IR written to {}\n", output_file);
+    }
+
+    // Write data sections if present
+    std::string final_data_file;
+    if (with_data && !result.data_ir.empty()) {
+        final_data_file = data_output_file;
+        if (final_data_file.empty()) {
+            // Auto-generate data file name based on main output
+            std::filesystem::path main_path(output_file);
+            std::filesystem::path data_path = main_path.parent_path() / std::format("{}_data{}", 
+                main_path.stem().string(), main_path.extension().string());
+            final_data_file = data_path.string();
+        }
+        
+        std::ofstream out(final_data_file);
+        if (!out) {
+            std::cerr << "Failed to open data output file: " << final_data_file << "\n";
+            // Non-fatal: continue
+            final_data_file.clear();
+        } else {
+            out << result.data_ir;
+            std::cout << std::format("Data sections written to {}\n", final_data_file);
+        }
+    }
+
+    // Print summary
+    std::cout << "\n";
+    std::cout << std::format("Lifted functions: {}\n", result.lifted_functions.size());
+    for (size_t i = 0; i < result.lifted_functions.size(); ++i) {
+        std::cout << std::format("  [{}] 0x{:016X}\n", i + 1, result.lifted_functions[i]);
+    }
+    
+    if (!result.included_data_sections.empty()) {
+        std::cout << std::format("Included data sections: {}\n", result.included_data_sections.size());
+        for (const auto& sec : result.included_data_sections) {
+            std::cout << std::format("  - {}\n", sec);
+        }
+    }
+
+    // Show compilation results or instructions
+    if (auto_compile) {
+        if (result.compilation_success) {
+            std::cout << "\nCompilation successful!\n";
+            std::cout << std::format("  Output executable: {}\n", result.output_executable_path);
+        } else {
+            std::cout << "\nCompilation failed!\n";
+            std::cout << std::format("  Error: {}\n", result.compilation_output);
+        }
+    } else {
+        std::cout << "\nThe exported IR is compile-ready and can be compiled with:\n";
+        std::string link_cmd = "  clang";
+        if (with_data && !result.data_ir.empty() && !final_data_file.empty()) {
+            std::cout << "  # Compile both files separately and link:\n";
+            std::cout << std::format("  clang -c {} -o code.o\n", output_file);
+            std::cout << std::format("  clang -c {} -o data.o\n", final_data_file);
+            link_cmd += " code.o data.o";
+        } else {
+            link_cmd += std::format(" {}", output_file);
+        }
+        
+        // Add entry point specification if provided
+        if (!entry_point.empty()) {
+            link_cmd += std::format(" -Wl,/ENTRY:{}", entry_point);
+        }
+        
+        // Add remill library if provided
+        if (!remill_lib_path.empty()) {
+            link_cmd += std::format(" \"{}\"", remill_lib_path);
+        }
+        
+        link_cmd += " -o output.exe";
+        std::cout << link_cmd << "\n";
+    }
+    
+    // Show unresolved symbols if any
+    if (!result.unresolved_symbols.empty()) {
+        std::cout << "\nWarning: The following symbols are unresolved:\n";
+        for (const auto& sym : result.unresolved_symbols) {
+            std::cout << std::format("  - {}\n", sym);
+        }
+        std::cout << "\nYou may need to provide additional libraries or object files.\n";
     }
 
     return 0;

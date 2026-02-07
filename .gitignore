@@ -404,3 +404,12 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# CMake
+build/
+install/
+CMakeUserPresets.json
+compile_commands.json
+
+# vcpkg
+vcpkg_installed/

@@ -1,0 +1,67 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "picanha",
+    "version": "0.1.0",
+    "description": "x86_64 Disassembler for Windows PE/COFF binaries",
+    "homepage": "https://github.com/binsnake/picanha",
+    "dependencies": [
+        "tbb",
+        {
+            "name": "sqlite3",
+            "features": ["json1"]
+        },
+        "spdlog",
+        "nlohmann-json",
+        "xxhash",
+        "cli11",
+        "glfw3",
+        {
+            "name": "imgui",
+            "features": ["docking-experimental", "glfw-binding", "opengl3-binding"]
+        },
+        "gtest",
+        "z3",
+        "doctest",
+        "cpp-httplib",
+        "gflags",
+        "glog",
+        {
+            "name": "qtbase",
+            "default-features": false,
+            "features": ["widgets", "concurrent"]
+        }
+    ],
+    "builtin-baseline": "8f095fa0342454181dc10f1b9c176c19b356ee67",
+    "overrides": [],
+    "features": {
+        "gui": {
+            "description": "Build GUI application with ImGui",
+            "dependencies": [
+                "glfw3",
+                {
+                    "name": "imgui",
+                    "features": ["docking-experimental", "glfw-binding", "opengl3-binding"]
+                }
+            ]
+        },
+        "gui-qt": {
+            "description": "Build GUI application with Qt6",
+            "dependencies": [
+                {
+                    "name": "qtbase",
+                    "default-features": false,
+                    "features": ["widgets", "concurrent"]
+                }
+            ]
+        },
+        "llvm": {
+            "description": "Enable LLVM/Remill integration"
+        },
+        "decompiler": {
+            "description": "Enable Rellic decompilation (requires Z3)",
+            "dependencies": [
+                "z3"
+            ]
+        }
+    }
+}

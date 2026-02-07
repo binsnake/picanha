@@ -1,0 +1,219 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 25,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "installDir": "${sourceDir}/install/${presetName}",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+            }
+        },
+        {
+            "name": "vcpkg-base",
+            "hidden": true,
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_TOOLCHAIN_FILE": {
+                    "type": "FILEPATH",
+                    "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+                },
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static"
+            }
+        },
+        {
+            "name": "msvc-debug",
+            "displayName": "MSVC Debug",
+            "description": "Debug build with MSVC",
+            "inherits": "vcpkg-base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "cl",
+                "CMAKE_CXX_COMPILER": "cl"
+            }
+        },
+        {
+            "name": "msvc-release",
+            "displayName": "MSVC Release",
+            "description": "Release build with MSVC",
+            "inherits": "vcpkg-base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "cl",
+                "CMAKE_CXX_COMPILER": "cl"
+            }
+        },
+        {
+            "name": "llvm-debug",
+            "displayName": "LLVM/Clang Debug",
+            "description": "Debug build with Clang-CL",
+            "inherits": "vcpkg-base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl"
+            }
+        },
+        {
+            "name": "llvm-release",
+            "displayName": "LLVM/Clang Release",
+            "description": "Release build with Clang-CL",
+            "inherits": "vcpkg-base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl"
+            }
+        },
+        {
+            "name": "llvm-relwithdebinfo",
+            "displayName": "LLVM/Clang RelWithDebInfo",
+            "description": "Release with debug info using Clang-CL",
+            "inherits": "vcpkg-base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl"
+            }
+        },
+        {
+            "name": "llvm-asan",
+            "displayName": "LLVM/Clang with ASAN",
+            "description": "Debug build with AddressSanitizer",
+            "inherits": "llvm-debug",
+            "cacheVariables": {
+                "PICANHA_ENABLE_ASAN": "ON"
+            }
+        },
+        {
+            "name": "llvm-remill-release",
+            "displayName": "LLVM/Clang Release with Remill",
+            "description": "Release build with LLVM/Remill lifting support",
+            "inherits": "base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "CMAKE_TOOLCHAIN_FILE": {
+                    "type": "FILEPATH",
+                    "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+                },
+                "VCPKG_TARGET_TRIPLET": "x64-windows",
+                "PICANHA_ENABLE_LLVM": "ON",
+                "PICANHA_ENABLE_DECOMPILER": "ON",
+                "PICANHA_BUILD_TESTS": "OFF",
+                "PICANHA_BUILD_PLUGINS": "OFF"
+            }
+        },
+        {
+            "name": "qt-release",
+            "displayName": "Qt6 Release",
+            "description": "Release build with Qt6 GUI",
+            "inherits": "base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "CMAKE_TOOLCHAIN_FILE": {
+                    "type": "FILEPATH",
+                    "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+                },
+                "VCPKG_TARGET_TRIPLET": "x64-windows",
+                "PICANHA_BUILD_GUI": "OFF",
+                "PICANHA_BUILD_GUI_QT": "ON",
+                "PICANHA_BUILD_TESTS": "OFF",
+                "PICANHA_BUILD_PLUGINS": "OFF"
+            }
+        },
+        {
+            "name": "qt-llvm-release",
+            "displayName": "Qt6 Release with LLVM",
+            "description": "Release build with Qt6 GUI and LLVM/Remill lifting",
+            "inherits": "base",
+            "generator": "Ninja",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "CMAKE_TOOLCHAIN_FILE": {
+                    "type": "FILEPATH",
+                    "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+                },
+                "VCPKG_TARGET_TRIPLET": "x64-windows",
+                "PICANHA_BUILD_GUI": "OFF",
+                "PICANHA_BUILD_GUI_QT": "ON",
+                "PICANHA_ENABLE_LLVM": "ON",
+                "PICANHA_ENABLE_DECOMPILER": "ON",
+                "PICANHA_BUILD_TESTS": "OFF",
+                "PICANHA_BUILD_PLUGINS": "OFF"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "msvc-debug",
+            "configurePreset": "msvc-debug"
+        },
+        {
+            "name": "msvc-release",
+            "configurePreset": "msvc-release"
+        },
+        {
+            "name": "llvm-debug",
+            "configurePreset": "llvm-debug"
+        },
+        {
+            "name": "llvm-release",
+            "configurePreset": "llvm-release"
+        },
+        {
+            "name": "llvm-relwithdebinfo",
+            "configurePreset": "llvm-relwithdebinfo"
+        },
+        {
+            "name": "llvm-asan",
+            "configurePreset": "llvm-asan"
+        },
+        {
+            "name": "llvm-remill-release",
+            "configurePreset": "llvm-remill-release"
+        },
+        {
+            "name": "qt-release",
+            "configurePreset": "qt-release"
+        },
+        {
+            "name": "qt-llvm-release",
+            "configurePreset": "qt-llvm-release"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "msvc-debug",
+            "configurePreset": "msvc-debug",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "llvm-debug",
+            "configurePreset": "llvm-debug",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ]
+}

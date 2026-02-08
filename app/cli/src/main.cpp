@@ -832,6 +832,9 @@ int cmd_export_lift(const std::string& binary_path, Address addr, int opt_level,
             link_cmd += std::format(" \"{}\"", remill_lib_path);
         }
         
+        // Add Windows system libraries
+        link_cmd += " -lkernel32 -luser32 -lshell32 -lucrt -lvcruntime -lmsvcrt";
+        
         link_cmd += " -o output.exe";
         std::cout << link_cmd << "\n";
     }

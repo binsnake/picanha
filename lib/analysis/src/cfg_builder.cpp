@@ -41,14 +41,28 @@ std::unique_ptr<CFG> CFGBuilder::build(Address entry_point) {
     block_starts_.insert(entry_point);
     entry_points_.push_back(entry_point);
 
-    // Phase 1: Decode
-    decode_function(entry_point);
+    // Phase 1: Decode (with absolute timeout)
+    auto start_time = std::chrono::steady_clock::now();
+    auto should_timeout = [&start_time]() {
+        auto elapsed = std::chrono::steady_clock::now() - start_time;
+        return elapsed > std::chrono::seconds(5);  // 5 second timeout per function
+    };
+
+    decode_function(entry_point, should_timeout);
 
     // Phase 2: Create blocks
-    create_blocks();
+    if (!should_timeout()) {
+        spdlog::debug("CFG builder: creating blocks for 0x{:X}", entry_point);
+        create_blocks();
+        spdlog::debug("CFG builder: created {} blocks for 0x{:X}", cfg_->block_count(), entry_point);
+    }
 
     // Phase 3: Add edges
-    add_edges();
+    if (!should_timeout()) {
+        spdlog::debug("CFG builder: adding edges for 0x{:X}", entry_point);
+        add_edges();
+        spdlog::debug("CFG builder: added edges for 0x{:X}", entry_point);
+    }
 
     // Set entry block
     if (auto* entry_block = cfg_->find_block_starting_at(entry_point)) {
@@ -105,6 +119,11 @@ std::unique_ptr<CFG> CFGBuilder::build_from_instructions(
 }
 
 void CFGBuilder::decode_function(Address entry) {
+    // Call implementation with no-op timeout
+    decode_function(entry, []() { return false; });
+}
+
+void CFGBuilder::decode_function(Address entry, std::function<bool()> should_timeout) {
     std::queue<Address> worklist;
     worklist.push(entry);
 
@@ -138,6 +157,11 @@ void CFGBuilder::decode_function(Address entry) {
     };
 
     while (!worklist.empty()) {
+        // Check timeout every iteration
+        if (should_timeout()) {
+            spdlog::warn("CFG builder: timeout at 0x{:X} after {} iterations", entry, worklist_iterations);
+            break;
+        }
         Address addr = worklist.front();
         worklist.pop();
         
@@ -255,12 +279,15 @@ void CFGBuilder::decode_function(Address entry) {
         entry, worklist_iterations, all_instructions_.size(), block_starts_.size());
 
     // Sort instructions by address
+    spdlog::debug("CFG builder: starting sort for 0x{:X} with {} instructions", entry, all_instructions_.size());
     std::sort(all_instructions_.begin(), all_instructions_.end(),
         [](const Instruction& a, const Instruction& b) {
             return a.ip() < b.ip();
         });
+    spdlog::debug("CFG builder: sort completed for 0x{:X}", entry);
 
     // Remove duplicates
+    spdlog::debug("CFG builder: removing duplicates for 0x{:X}", entry);
     all_instructions_.erase(
         std::unique(all_instructions_.begin(), all_instructions_.end(),
             [](const Instruction& a, const Instruction& b) {
@@ -268,6 +295,7 @@ void CFGBuilder::decode_function(Address entry) {
             }),
         all_instructions_.end()
     );
+    spdlog::debug("CFG builder: decode_function completed for 0x{:X} with {} instructions", entry, all_instructions_.size());
 }
 
 std::vector<Instruction> CFGBuilder::decode_block(Address addr) {

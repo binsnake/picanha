@@ -10,6 +10,8 @@
 #include <memory>
 #include <vector>
 #include <unordered_set>
+#include <functional>
+#include <chrono>
 
 namespace picanha::analysis {
 
@@ -53,6 +55,7 @@ public:
 private:
     // Phase 1: Decode and identify block boundaries
     void decode_function(Address entry);
+    void decode_function(Address entry, std::function<bool()> should_timeout);
 
     // Phase 2: Split instructions into basic blocks
     void create_blocks();

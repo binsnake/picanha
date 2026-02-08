@@ -1,4 +1,5 @@
 #include "picanha/analysis/cfg.hpp"
+#include <spdlog/spdlog.h>
 #include <queue>
 #include <stack>
 #include <algorithm>
@@ -301,17 +302,27 @@ std::vector<BlockId> CFG::reverse_postorder() const {
 void CFG::compute_dominators() {
     if (entry_block_ == INVALID_BLOCK_ID || blocks_.empty()) return;
 
-    // Simple dominator computation using iterative dataflow
-    // Entry dominates itself
+    // Clear all dominators first
+    for (auto& [id, block] : blocks_) {
+        block.set_immediate_dominator(INVALID_BLOCK_ID);
+    }
+
+    // Entry block dominates itself
     auto* entry = find_block(entry_block_);
     if (entry) {
         entry->set_immediate_dominator(entry_block_);
     }
 
+    // Get blocks in reverse postorder (excluding entry)
     auto rpo = reverse_postorder();
+    
+    // Iterative dataflow algorithm for dominators
+    // Based on Cooper, Harvey, and Kennedy's algorithm
     bool changed = true;
+    constexpr std::size_t max_iterations = 10000;
+    std::size_t iteration = 0;
 
-    while (changed) {
+    while (changed && iteration++ < max_iterations) {
         changed = false;
 
         for (BlockId id : rpo) {
@@ -323,7 +334,7 @@ void CFG::compute_dominators() {
             const auto& preds = block->predecessors();
             if (preds.empty()) continue;
 
-            // Find first processed predecessor
+            // Find the first predecessor with a valid dominator
             BlockId new_idom = INVALID_BLOCK_ID;
             for (BlockId pred : preds) {
                 auto* pred_block = find_block(pred);
@@ -335,7 +346,7 @@ void CFG::compute_dominators() {
 
             if (new_idom == INVALID_BLOCK_ID) continue;
 
-            // Intersect with other predecessors
+            // Intersect dominators of all predecessors
             for (BlockId pred : preds) {
                 if (pred == new_idom) continue;
 
@@ -344,15 +355,50 @@ void CFG::compute_dominators() {
                     continue;
                 }
 
-                // Find common dominator (simplified - just take the one closer to entry)
-                // A proper implementation would use the intersect algorithm
+                // Intersection: walk up the dominator tree of both
+                // until we find a common ancestor
+                BlockId idom1 = new_idom;
+                BlockId idom2 = pred;
+                
+                // Build path from pred to root
+                std::unordered_set<BlockId> path;
+                BlockId current = idom2;
+                std::size_t safety = 0;
+                while (current != INVALID_BLOCK_ID && current != entry_block_ && safety++ < 1000) {
+                    path.insert(current);
+                    auto* curr_block = find_block(current);
+                    if (!curr_block) break;
+                    current = curr_block->immediate_dominator();
+                }
+                path.insert(entry_block_);
+                
+                // Walk from idom1 until we hit the path
+                current = idom1;
+                safety = 0;
+                while (current != INVALID_BLOCK_ID && safety++ < 1000) {
+                    if (path.count(current)) {
+                        new_idom = current;
+                        break;
+                    }
+                    auto* curr_block = find_block(current);
+                    if (!curr_block) break;
+                    current = curr_block->immediate_dominator();
+                }
             }
 
-            if (block->immediate_dominator() != new_idom) {
-                block->set_immediate_dominator(new_idom);
-                changed = true;
+            if (new_idom != INVALID_BLOCK_ID && block->immediate_dominator() != new_idom) {
+                // Safety check: don't create self-dominators or cycles
+                if (new_idom != id) {
+                    block->set_immediate_dominator(new_idom);
+                    changed = true;
+                }
             }
         }
+    }
+    
+    if (iteration >= max_iterations) {
+        spdlog::warn("Dominator computation did not converge after {} iterations for CFG with {} blocks", 
+            max_iterations, blocks_.size());
     }
 }
 
@@ -360,7 +406,10 @@ bool CFG::dominates(BlockId dominator, BlockId block) const {
     if (dominator == block) return true;
 
     const BasicBlock* current = find_block(block);
-    while (current && current->id() != entry_block_) {
+    std::size_t iterations = 0;
+    constexpr std::size_t max_dominator_walk = 10000;
+    
+    while (current && current->id() != entry_block_ && iterations++ < max_dominator_walk) {
         BlockId idom = current->immediate_dominator();
         if (idom == dominator) return true;
         if (idom == INVALID_BLOCK_ID) break;
@@ -393,6 +442,8 @@ void CFG::detect_loops() {
     }
 
     // For each loop header, find loop body using reverse DFS
+    constexpr std::size_t max_loop_iterations = 10000;
+    
     for (BlockId header : loop_headers_) {
         std::vector<BlockId> body;
         body.push_back(header);
@@ -413,8 +464,10 @@ void CFG::detect_loops() {
         // Reverse DFS to find loop body
         std::unordered_set<BlockId> visited;
         visited.insert(header);
+        
+        std::size_t iterations = 0;
 
-        while (!worklist.empty()) {
+        while (!worklist.empty() && iterations++ < max_loop_iterations) {
             BlockId id = worklist.top();
             worklist.pop();
 
@@ -430,6 +483,11 @@ void CFG::detect_loops() {
                     }
                 }
             }
+        }
+        
+        if (iterations >= max_loop_iterations) {
+            spdlog::warn("Loop detection exceeded max iterations ({}) for header block {} ({} blocks total)", 
+                max_loop_iterations, header, blocks_.size());
         }
 
         loop_body_[header] = std::move(body);

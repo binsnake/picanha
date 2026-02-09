@@ -1,9 +1,13 @@
 #pragma once
 
 #include <picanha/loader/binary.hpp>
+#include <picanha/analysis/jump_table.hpp>
+#include <picanha/disasm/decoder.hpp>
 #include <remill/BC/TraceLifter.h>
+#include <remill/Arch/Instruction.h>
 #include <memory>
 #include <string>
+#include <vector>
 #include <unordered_map>
 
 namespace picanha::lift {
@@ -32,6 +36,11 @@ public:
     // Try to read an executable byte from the binary
     bool TryReadExecutableByte(std::uint64_t addr, std::uint8_t* byte) override;
 
+    // Devirtualize indirect jumps (jump table analysis)
+    void ForEachDevirtualizedTarget(
+        const remill::Instruction& inst,
+        std::function<void(uint64_t, remill::DevirtualizedTargetKind)> func) override;
+
     // Additional methods for picanha integration
 
     // Get all lifted traces
@@ -58,6 +67,10 @@ public:
     void clear();
 
 private:
+    // Analyze jump table patterns to recover indirect jump targets
+    [[nodiscard]] std::vector<uint64_t> analyze_jump_table(
+        const remill::Instruction& inst) const;
+
     std::shared_ptr<loader::Binary> binary_;
     std::unordered_map<std::uint64_t, llvm::Function*> lifted_traces_;
     std::unordered_map<std::uint64_t, llvm::Function*> declared_traces_;

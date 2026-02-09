@@ -176,6 +176,89 @@ std::optional<JumpTable> JumpTableAnalyzer::analyze_pattern(
         }
     }
 
+    // Pattern 5: jmp reg with relative offset table (LLVM/Rust pattern)
+    //   lea base_reg, [rip + disp32]        ; base_reg = table_base
+    //   movsxd off_reg, [base_reg + idx*4]  ; off_reg = sign_extend(table[idx])
+    //   add base_reg, off_reg               ; base_reg = table_base + offset
+    //   jmp base_reg                        ; indirect jump
+    if (op_kind == iced_x86::OpKind::REGISTER) {
+        auto jump_reg = underlying.op_register(0);
+
+        // Look backward for ADD dest, src where dest is jump_reg
+        for (std::size_t i = jump_index; i > 0 && i > jump_index - 10; --i) {
+            const auto& add_instr = instructions[i - 1];
+            const auto& add_u = add_instr.raw();
+
+            if (add_u.mnemonic() != iced_x86::Mnemonic::ADD) continue;
+            if (add_u.op_count() < 2) continue;
+            if (add_u.op_kind(0) != iced_x86::OpKind::REGISTER) continue;
+            if (add_u.op_register(0) != jump_reg) continue;
+            if (add_u.op_kind(1) != iced_x86::OpKind::REGISTER) continue;
+
+            auto offset_reg = add_u.op_register(1);
+
+            // Look backward for MOVSXD offset_reg, [base + idx * scale]
+            for (std::size_t j = i - 1; j > 0 && j > i - 10; --j) {
+                const auto& movsxd_instr = instructions[j - 1];
+                const auto& movsxd_u = movsxd_instr.raw();
+
+                if (movsxd_u.mnemonic() != iced_x86::Mnemonic::MOVSXD) continue;
+                if (movsxd_u.op_count() < 2) continue;
+                if (movsxd_u.op_kind(0) != iced_x86::OpKind::REGISTER) continue;
+                if (movsxd_u.op_register(0) != offset_reg) continue;
+                if (movsxd_u.op_kind(1) != iced_x86::OpKind::MEMORY) continue;
+
+                auto movsxd_base = movsxd_u.memory_base();
+                auto movsxd_scale = movsxd_u.memory_index_scale();
+
+                // The memory base of the MOVSXD should be the same register
+                // that the LEA loaded (which is also jump_reg)
+                if (movsxd_base != jump_reg) continue;
+
+                // Look backward for LEA jump_reg, [rip + disp]
+                for (std::size_t k = j - 1; k > 0 && k > j - 10; --k) {
+                    const auto& lea_instr = instructions[k - 1];
+
+                    if (lea_instr.mnemonic() != iced_x86::Mnemonic::LEA) continue;
+                    if (lea_instr.op_count() < 2) continue;
+                    if (lea_instr.op_kind(0) != iced_x86::OpKind::REGISTER) continue;
+                    if (lea_instr.op_register(0) != jump_reg) continue;
+                    if (lea_instr.memory_base() != iced_x86::Register::RIP) continue;
+
+                    // Compute table base: LEA next_ip + displacement
+                    Address table_base = lea_instr.compute_rip_relative_address();
+                    if (table_base == INVALID_ADDRESS) continue;
+
+                    std::size_t entry_size = movsxd_scale > 0 ? movsxd_scale : 4;
+                    std::size_t max_entries = bounds_info.found
+                        ? bounds_info.bound
+                        : config_.max_entries;
+
+                    if (auto table = try_relative_table(
+                            table_base, table_base, entry_size, true)) {
+                        table->instruction_address = jump_instr.ip();
+                        table->entry_count = std::min(
+                            table->targets.size(), max_entries);
+                        table->targets.resize(table->entry_count);
+                        table->entry_type = JumpTableEntryType::Relative32;
+
+                        if (bounds_info.found) {
+                            table->bounds_check_addr = bounds_info.address;
+                            table->max_index = bounds_info.bound;
+                            table->confidence = 95;
+                        } else {
+                            table->confidence = 80;
+                        }
+
+                        return table;
+                    }
+                }
+            }
+
+            break;
+        }
+    }
+
     return std::nullopt;
 }
 
@@ -204,7 +287,7 @@ std::optional<JumpTable> JumpTableAnalyzer::resolve_table(
         case JumpTableEntryType::Relative8:
             table.targets = read_relative_entries(
                 table_address, base_address, entry_size, max_entries,
-                false  // unsigned
+                true  // signed relative offsets
             );
             break;
 

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"D:\\\\binsnake\\\\picanha\\\\lib\\\\loader\"\" 2>/dev/null || echo \"Directory may not exist \")",
+      "Bash(cmake --build:*)",
+      "Bash(ninja:*)"
+    ]
+  }
+}

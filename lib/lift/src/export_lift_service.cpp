@@ -1,5 +1,7 @@
 #include <picanha/lift/export_lift_service.hpp>
 #include <picanha/lift/lifted_function.hpp>
+#include <picanha/lift/trace_manager_impl.hpp>
+#include <picanha/lift/ir_optimizer.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -14,6 +16,7 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Linker/Linker.h>
 
+#include <remill/BC/TraceLifter.h>
 #include <remill/BC/Util.h>
 
 #include <format>
@@ -63,6 +66,372 @@ static std::string get_base_name(llvm::StringRef name) {
         return n.substr(0, dot_pos);
     }
     return n;
+}
+
+// --------------------------------------------------------------------------
+// Remill Intrinsic Lowering
+// --------------------------------------------------------------------------
+// Replaces __remill_* intrinsic call sites with native LLVM IR (loads, stores,
+// dispatches) so the recompiled binary actually performs real operations instead
+// of calling stubs that return null/zero.
+
+static void lower_remill_intrinsics(llvm::Module& module) {
+    auto& ctx = module.getContext();
+    llvm::IRBuilder<> builder(ctx);
+    static const std::regex sub_regex(R"(sub_([0-9a-fA-F]+).*)");
+
+    // Step 0: Strip remill's optimization-blocking attributes from intrinsics.
+    // Remill's IntrinsicTable.cpp marks all __remill_* functions with NoDuplicate,
+    // OptimizeNone, NoInline. These survive CloneModule and prevent LLVM from
+    // inlining or optimizing through the intrinsics after we give them bodies.
+    for (auto& func : module.functions()) {
+        if (!func.getName().starts_with("__remill_")) continue;
+        func.removeFnAttr(llvm::Attribute::NoDuplicate);
+        func.removeFnAttr(llvm::Attribute::OptimizeNone);
+        func.removeFnAttr(llvm::Attribute::NoInline);
+    }
+
+    // Step 1: Build trace address map
+    std::map<uint64_t, llvm::Function*> trace_map;
+    for (auto& func : module.functions()) {
+        if (func.isDeclaration()) continue;
+        std::string name = func.getName().str();
+        std::smatch match;
+        if (std::regex_match(name, match, sub_regex)) {
+            try {
+                uint64_t addr = std::stoull(match[1].str(), nullptr, 16);
+                trace_map[addr] = &func;
+            } catch (...) {}
+        }
+    }
+    spdlog::info("lower_remill_intrinsics: found {} trace functions", trace_map.size());
+
+    // Step 2: Create dispatch bodies for control-flow intrinsics
+
+    // __remill_function_return: just return %mem (arg 2)
+    if (auto* func = module.getFunction("__remill_function_return")) {
+        if (func->isDeclaration()) {
+            func->getArg(0)->addAttr(llvm::Attribute::NoAlias);  // State*
+            func->getArg(2)->addAttr(llvm::Attribute::NoAlias);  // Memory*
+            auto* bb = llvm::BasicBlock::Create(ctx, "entry", func);
+            builder.SetInsertPoint(bb);
+            builder.CreateRet(func->getArg(2)); // return %mem
+            func->setLinkage(llvm::GlobalValue::InternalLinkage);
+            spdlog::debug("Lowered __remill_function_return");
+        }
+    }
+
+    // Helper lambda to build a switch dispatch over all known traces
+    auto build_dispatch = [&](llvm::Function* func, const char* label) {
+        if (!func || !func->isDeclaration()) return;
+
+        func->getArg(0)->addAttr(llvm::Attribute::NoAlias);  // State*
+        func->getArg(2)->addAttr(llvm::Attribute::NoAlias);  // Memory*
+
+        auto* entry_bb = llvm::BasicBlock::Create(ctx, "entry", func);
+        auto* default_bb = llvm::BasicBlock::Create(ctx, "default", func);
+
+        builder.SetInsertPoint(entry_bb);
+        llvm::Value* addr_arg = func->getArg(1);  // i64 %addr
+        auto* sw = builder.CreateSwitch(addr_arg, default_bb, trace_map.size());
+
+        for (auto& [addr, target] : trace_map) {
+            auto* case_bb = llvm::BasicBlock::Create(ctx, std::format("{}_{:X}", label, addr), func);
+            sw->addCase(llvm::ConstantInt::get(llvm::Type::getInt64Ty(ctx), addr), case_bb);
+
+            builder.SetInsertPoint(case_bb);
+            // Call the trace: ptr @sub_XXX(ptr %state, i64 %addr, ptr %mem)
+            std::vector<llvm::Value*> args = {func->getArg(0), addr_arg, func->getArg(2)};
+            auto* call = builder.CreateCall(target->getFunctionType(), target, args);
+            builder.CreateRet(call);
+        }
+
+        // Unknown dispatch target is a program error — use unreachable so LLVM
+        // can prove this path dead and fold the switch when all addresses are constants.
+        builder.SetInsertPoint(default_bb);
+        builder.CreateUnreachable();
+
+        func->setLinkage(llvm::GlobalValue::InternalLinkage);
+        spdlog::debug("Lowered {} with {} dispatch entries", func->getName().str(), trace_map.size());
+    };
+
+    build_dispatch(module.getFunction("__remill_function_call"), "call");
+    build_dispatch(module.getFunction("__remill_jump"), "jmp");
+
+    // __remill_error, __remill_missing_block: return %mem
+    for (const char* name : {"__remill_error", "__remill_missing_block"}) {
+        if (auto* func = module.getFunction(name)) {
+            if (func->isDeclaration()) {
+                func->getArg(0)->addAttr(llvm::Attribute::NoAlias);  // State*
+                func->getArg(2)->addAttr(llvm::Attribute::NoAlias);  // Memory*
+                auto* bb = llvm::BasicBlock::Create(ctx, "entry", func);
+                builder.SetInsertPoint(bb);
+                builder.CreateRet(func->getArg(2));
+                func->setLinkage(llvm::GlobalValue::InternalLinkage);
+                spdlog::debug("Lowered {}", name);
+            }
+        }
+    }
+
+    // Steps 3 & 4: Inline-replace memory and other intrinsic call sites
+    // We collect instructions to erase after processing to avoid iterator invalidation.
+    std::vector<llvm::Instruction*> to_erase;
+    unsigned devirtualized = 0;
+
+    for (auto& func : module.functions()) {
+        if (func.isDeclaration()) continue;
+
+        for (auto& bb : func) {
+            for (auto& inst : bb) {
+                auto* call = llvm::dyn_cast<llvm::CallInst>(&inst);
+                if (!call) continue;
+
+                auto* callee = call->getCalledFunction();
+                if (!callee) continue;
+
+                llvm::StringRef cname = callee->getName();
+                if (!cname.starts_with("__remill_")) continue;
+
+                builder.SetInsertPoint(call);
+
+                // --- Memory reads ---
+                if (cname == "__remill_read_memory_8" || cname == "__remill_read_memory_16" ||
+                    cname == "__remill_read_memory_32" || cname == "__remill_read_memory_64") {
+                    // Signature: rettype (ptr %mem, i64 %addr)
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Type* ret_ty = call->getType();
+                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(ret_ty));
+                    auto* val = builder.CreateAlignedLoad(ret_ty, ptr, llvm::MaybeAlign(1));
+                    call->replaceAllUsesWith(val);
+                    to_erase.push_back(call);
+                }
+                else if (cname == "__remill_read_memory_f32" || cname == "__remill_read_memory_f64" ||
+                         cname == "__remill_read_memory_f128") {
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Type* ret_ty = call->getType();
+                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(ret_ty));
+                    auto* val = builder.CreateAlignedLoad(ret_ty, ptr, llvm::MaybeAlign(1));
+                    call->replaceAllUsesWith(val);
+                    to_erase.push_back(call);
+                }
+                else if (cname == "__remill_read_memory_f80") {
+                    // Signature: ptr (ptr %mem, i64 %addr, ptr %ref) — writes to reference param
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* ref = call->getArgOperand(2);
+                    auto* fp80_ty = llvm::Type::getX86_FP80Ty(ctx);
+                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(fp80_ty));
+                    auto* val = builder.CreateAlignedLoad(fp80_ty, ptr, llvm::MaybeAlign(1));
+                    builder.CreateStore(val, ref);
+                    call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
+                    to_erase.push_back(call);
+                }
+                // --- Memory writes ---
+                else if (cname == "__remill_write_memory_8" || cname == "__remill_write_memory_16" ||
+                         cname == "__remill_write_memory_32" || cname == "__remill_write_memory_64") {
+                    // Signature: ptr (ptr %mem, i64 %addr, valtype %val)
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* val = call->getArgOperand(2);
+                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(val->getType()));
+                    builder.CreateAlignedStore(val, ptr, llvm::MaybeAlign(1));
+                    call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
+                    to_erase.push_back(call);
+                }
+                else if (cname == "__remill_write_memory_f32" || cname == "__remill_write_memory_f64" ||
+                         cname == "__remill_write_memory_f128") {
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* val = call->getArgOperand(2);
+                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(val->getType()));
+                    builder.CreateAlignedStore(val, ptr, llvm::MaybeAlign(1));
+                    call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
+                    to_erase.push_back(call);
+                }
+                else if (cname == "__remill_write_memory_f80") {
+                    // Signature: ptr (ptr %mem, i64 %addr, ptr %ref) — reads from const reference
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* ref = call->getArgOperand(2);
+                    auto* fp80_ty = llvm::Type::getX86_FP80Ty(ctx);
+                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(fp80_ty));
+                    auto* val = builder.CreateAlignedLoad(fp80_ty, ref, llvm::MaybeAlign(1));
+                    builder.CreateAlignedStore(val, ptr, llvm::MaybeAlign(1));
+                    call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
+                    to_erase.push_back(call);
+                }
+                // --- Barriers, atomics, delay slots: pass-through %mem ---
+                else if (cname.starts_with("__remill_barrier_") ||
+                         cname == "__remill_atomic_begin" || cname == "__remill_atomic_end" ||
+                         cname == "__remill_delay_slot_begin" || cname == "__remill_delay_slot_end") {
+                    if (!call->getType()->isVoidTy())
+                        call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem (arg 0)
+                    to_erase.push_back(call);
+                }
+                // --- Undefined values ---
+                else if (cname.starts_with("__remill_undefined_")) {
+                    call->replaceAllUsesWith(llvm::UndefValue::get(call->getType()));
+                    to_erase.push_back(call);
+                }
+                // --- Flag computations: return arg[0] (the computed condition) ---
+                else if (cname.starts_with("__remill_flag_computation_")) {
+                    if (call->arg_size() > 0) {
+                        llvm::Value* cond = call->getArgOperand(0);
+                        if (cond->getType() != call->getType())
+                            cond = builder.CreateZExtOrBitCast(cond, call->getType());
+                        call->replaceAllUsesWith(cond);
+                    } else {
+                        call->replaceAllUsesWith(llvm::UndefValue::get(call->getType()));
+                    }
+                    to_erase.push_back(call);
+                }
+                // --- Compare-exchange ---
+                else if (cname.starts_with("__remill_compare_exchange_memory_")) {
+                    // Signature: ptr (ptr %mem, i64 %addr, ptr %expected_ref, intN %desired)
+                    llvm::Value* mem = call->getArgOperand(0);
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* expected_ref = call->getArgOperand(2);
+                    llvm::Value* desired = call->getArgOperand(3);
+
+                    llvm::Type* val_ty = desired->getType();
+                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(val_ty));
+
+                    // Non-atomic lowering: load old, compare, conditionally store
+                    auto* old_val = builder.CreateAlignedLoad(val_ty, ptr, llvm::MaybeAlign(1));
+                    auto* expected_val = builder.CreateAlignedLoad(val_ty, expected_ref, llvm::MaybeAlign(1));
+                    auto* cmp = builder.CreateICmpEQ(old_val, expected_val);
+
+                    // If equal, store desired; either way, store old to expected_ref
+                    auto* select_val = builder.CreateSelect(cmp, desired, old_val);
+                    builder.CreateAlignedStore(select_val, ptr, llvm::MaybeAlign(1));
+                    builder.CreateAlignedStore(old_val, expected_ref, llvm::MaybeAlign(1));
+
+                    call->replaceAllUsesWith(mem);
+                    to_erase.push_back(call);
+                }
+                // --- I/O port reads ---
+                else if (cname.starts_with("__remill_read_io_port_")) {
+                    call->replaceAllUsesWith(llvm::Constant::getNullValue(call->getType()));
+                    to_erase.push_back(call);
+                }
+                // --- I/O port writes ---
+                else if (cname.starts_with("__remill_write_io_port_")) {
+                    if (!call->getType()->isVoidTy())
+                        call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
+                    to_erase.push_back(call);
+                }
+                // --- FPU control ---
+                else if (cname.starts_with("__remill_fpu_")) {
+                    if (call->getType()->isVoidTy()) {
+                        // void-returning FPU intrinsics (e.g. set_rounding) - just erase
+                    } else if (call->getType()->isPointerTy()) {
+                        call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
+                    } else {
+                        call->replaceAllUsesWith(llvm::Constant::getNullValue(call->getType()));
+                    }
+                    to_erase.push_back(call);
+                }
+                // --- Comparisons: return arg[0] (the computed condition) ---
+                else if (cname.starts_with("__remill_compare_") &&
+                         !cname.starts_with("__remill_compare_exchange_")) {
+                    if (call->arg_size() > 0) {
+                        llvm::Value* cond = call->getArgOperand(0);
+                        if (cond->getType() != call->getType())
+                            cond = builder.CreateZExtOrBitCast(cond, call->getType());
+                        call->replaceAllUsesWith(cond);
+                    } else {
+                        call->replaceAllUsesWith(llvm::UndefValue::get(call->getType()));
+                    }
+                    to_erase.push_back(call);
+                }
+                // --- Control flow: devirtualize dispatch and strip musttail ---
+                else if (cname == "__remill_function_call" || cname == "__remill_jump") {
+                    // Strip musttail so LLVM's inliner can work on these calls
+                    call->setTailCallKind(llvm::CallInst::TCK_None);
+
+                    // Devirtualize: if addr is a constant, replace dispatch with direct call
+                    if (auto* addr_const = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(1))) {
+                        uint64_t target_addr = addr_const->getZExtValue();
+                        auto it = trace_map.find(target_addr);
+                        if (it != trace_map.end()) {
+                            call->setCalledFunction(it->second);
+                            devirtualized++;
+                        }
+                    }
+                }
+                else if (cname == "__remill_function_return" ||
+                         cname == "__remill_error" || cname == "__remill_missing_block") {
+                    call->setTailCallKind(llvm::CallInst::TCK_None);
+                }
+                // --- Hypercalls: no-op for user-mode recompilation ---
+                // The semantics module contains a full hypercall dispatcher with
+                // cpuid, rdtsc, syscall, lgdt, etc. None of these are meaningful
+                // in a recompiled user-mode binary. Replace with pass-through of Memory*.
+                else if (cname == "__remill_async_hyper_call") {
+                    // Signature: ptr (ptr %state, i64 %addr, ptr %mem) -> ptr
+                    call->replaceAllUsesWith(call->getArgOperand(2)); // return %mem
+                    to_erase.push_back(call);
+                }
+                else if (cname == "__remill_sync_hyper_call") {
+                    // Signature: ptr (ptr %state, ptr %mem, i64 %addr) -> ptr
+                    call->replaceAllUsesWith(call->getArgOperand(1)); // return %mem
+                    to_erase.push_back(call);
+                }
+            }
+        }
+    }
+
+    // Step 5: Cleanup - erase dead call instructions
+    for (auto* inst : to_erase) {
+        inst->eraseFromParent();
+    }
+
+    spdlog::info("lower_remill_intrinsics: replaced {} intrinsic call sites, devirtualized {} dispatch calls", to_erase.size(), devirtualized);
+
+    // Step 5b: Delete hypercall function bodies from the semantics module.
+    // These contain massive switch dispatchers (cpuid, rdtsc, syscall, lgdt, etc.)
+    // that bloat the output if LLVM decides to inline them.
+    for (const char* name : {"__remill_async_hyper_call", "__remill_sync_hyper_call"}) {
+        if (auto* func = module.getFunction(name)) {
+            if (!func->isDeclaration()) {
+                func->deleteBody();
+                spdlog::debug("Deleted body of {}", name);
+            }
+        }
+    }
+
+    // Step 6: Eliminate dead Memory* chain in trace functions.
+    // After all intrinsic call sites are lowered, the Memory* parameter (arg 2)
+    // of each trace function is completely dead — no instruction dereferences it.
+    // But the RAUW chain (%mem0 → %mem1 → ...) creates SSA dependencies that
+    // LLVM must trace through for value numbering and DSE.
+    for (auto& func : module.functions()) {
+        if (func.isDeclaration() || !func.getName().starts_with("sub_")) continue;
+        if (func.arg_size() < 3) continue;
+        llvm::Argument* mem_arg = func.getArg(2);
+
+        // Safety: skip if %mem is used by load, store, or GEP (would mean it's still needed)
+        bool safe = true;
+        for (auto& use : mem_arg->uses()) {
+            if (llvm::isa<llvm::LoadInst>(use.getUser()) ||
+                llvm::isa<llvm::GetElementPtrInst>(use.getUser()) ||
+                llvm::isa<llvm::StoreInst>(use.getUser())) {
+                safe = false;
+                break;
+            }
+        }
+        if (!safe) continue;
+
+        mem_arg->replaceAllUsesWith(llvm::PoisonValue::get(mem_arg->getType()));
+    }
+
+    // Step 7: Ensure noalias on State* (arg 0) and Memory* (arg 2) for all trace functions.
+    // While CloneModule should preserve these from remill's DeclareLiftedFunction,
+    // this acts as a safety net for alias analysis.
+    for (auto& func : module.functions()) {
+        if (func.isDeclaration() || !func.getName().starts_with("sub_")) continue;
+        if (func.arg_size() < 3) continue;
+        if (!func.getArg(0)->hasAttribute(llvm::Attribute::NoAlias))
+            func.getArg(0)->addAttr(llvm::Attribute::NoAlias);
+        if (!func.getArg(2)->hasAttribute(llvm::Attribute::NoAlias))
+            func.getArg(2)->addAttr(llvm::Attribute::NoAlias);
+    }
 }
 
 static void generate_runtime_stubs(llvm::Module& module) {
@@ -208,7 +577,9 @@ ExportLiftResult ExportLiftService::export_function(Address entry, const ExportL
     if (!initialized_) return {false, "Not initialized"};
 
     ExportLiftResult result;
-    auto& ctx = lifting_service_->context()->context();
+    auto* context = lifting_service_->context();
+    auto ctx_lock = context->lock();
+    auto& ctx = context->context();
 
     std::queue<Address> queue;
     std::set<Address> visited;
@@ -217,31 +588,54 @@ ExportLiftResult ExportLiftService::export_function(Address entry, const ExportL
 
     std::string main_trace_name;
 
-    // 1. Recursive Lifting to populate the context's semantics module
-    // We let Remill handle the internal linking during this phase.
+    // 1. Recursive Lifting to populate the context's semantics module.
+    // Use a SINGLE persistent trace manager so remill knows about all
+    // previously lifted traces and avoids duplicate definitions.
+    PicanhaTraceManager trace_manager(binary_);
+    remill::TraceLifter lifter(context->arch(), trace_manager);
+
     while(!queue.empty()) {
         Address current_addr = queue.front();
         queue.pop();
         result.lifted_functions.push_back(current_addr);
 
-        spdlog::info("Lifting 0x{:X}...", current_addr);
-
-        auto lift_result = lifting_service_->lift_address(current_addr);
-        if (!lift_result.success || !lift_result.lifted) {
-            spdlog::error("Failed to lift 0x{:X}: {}", current_addr, lift_result.error);
+        // Skip if already lifted by a previous Lift() call (the persistent
+        // trace manager tracks all definitions across calls).
+        if (trace_manager.GetLiftedTraceDefinition(current_addr)) {
+            spdlog::debug("Already lifted 0x{:X}, skipping", current_addr);
+            if (current_addr == entry) {
+                main_trace_name = trace_manager.TraceName(current_addr);
+            }
             continue;
         }
 
-        if (current_addr == entry) main_trace_name = lift_result.lifted->function()->getName().str();
+        spdlog::info("Lifting 0x{:X}...", current_addr);
+
+        // Lift using the persistent lifter. The callback filters by address
+        // so we capture the correct function (not a recursively-lifted callee).
+        llvm::Function* entry_func = nullptr;
+        bool lift_success = lifter.Lift(current_addr,
+            [&entry_func, current_addr](uint64_t addr, llvm::Function* fn) {
+                if (addr == current_addr) {
+                    entry_func = fn;
+                }
+            });
+
+        if (!lift_success || !entry_func) {
+            spdlog::error("Failed to lift 0x{:X}", current_addr);
+            continue;
+        }
+
+        if (current_addr == entry) {
+            main_trace_name = entry_func->getName().str();
+        }
 
         if (config.include_dependencies) {
-            if (auto* func = lift_result.lifted->function()) {
-                auto deps = collect_called_addresses(func);
-                for (Address dep : deps) {
-                    if (visited.find(dep) == visited.end()) {
-                        visited.insert(dep);
-                        queue.push(dep);
-                    }
+            auto deps = collect_called_addresses(entry_func);
+            for (Address dep : deps) {
+                if (visited.find(dep) == visited.end()) {
+                    visited.insert(dep);
+                    queue.push(dep);
                 }
             }
         }
@@ -334,9 +728,13 @@ ExportLiftResult ExportLiftService::export_function(Address entry, const ExportL
     if (auto* g = export_module->getGlobalVariable("llvm.compiler.used")) g->eraseFromParent();
     if (auto* f = export_module->getFunction("__remill_intrinsics")) f->eraseFromParent();
 
-    // 6. Generate Stubs & Entry Point
+    // 6. Lower remill intrinsics to native operations
+    lower_remill_intrinsics(*export_module);
+
+    // 7. Generate stubs for any remaining intrinsics
     generate_runtime_stubs(*export_module);
 
+    // 8. Entry point wrapper
     if (!config.entry_point_name.empty() && !main_trace_name.empty()) {
         if (auto* target = export_module->getFunction(main_trace_name)) {
             auto* wrapper = llvm::Function::Create(target->getFunctionType(),
@@ -354,6 +752,62 @@ ExportLiftResult ExportLiftService::export_function(Address entry, const ExportL
         } else {
             spdlog::warn("Could not find main trace '{}' to create entry point", main_trace_name);
         }
+    }
+
+    // 9. Prepare for aggressive inlining and dead store elimination
+    if (config.opt_level >= OptimizationLevel::O2) {
+        // Internalize non-entry traces so LLVM can inline and optimize through them.
+        // This is critical for DSE: after inlining, LLVM can see that State struct
+        // stores in the caller are overwritten by the inlined callee → dead stores.
+        for (auto& func : *export_module) {
+            if (func.isDeclaration()) continue;
+            std::string name = func.getName().str();
+            if (name.starts_with("sub_") && name != main_trace_name) {
+                func.setLinkage(llvm::GlobalValue::InternalLinkage);
+            }
+        }
+
+        // Force-inline the thin dispatch/control-flow wrappers so LLVM can see
+        // through __remill_function_call → sub_XXX call chains.
+        for (const char* n : {"__remill_function_call", "__remill_jump",
+                              "__remill_function_return", "__remill_error",
+                              "__remill_missing_block"}) {
+            if (auto* f = export_module->getFunction(n)) {
+                if (!f->isDeclaration()) {
+                    f->addFnAttr(llvm::Attribute::AlwaysInline);
+                    f->setLinkage(llvm::GlobalValue::InternalLinkage);
+                }
+            }
+        }
+
+        // Remove dead dispatch functions after devirtualization — if all call sites
+        // were devirtualized to direct calls, the dispatch body is unreachable.
+        for (const char* n : {"__remill_function_call", "__remill_jump"}) {
+            if (auto* f = export_module->getFunction(n)) {
+                if (!f->isDeclaration() && f->use_empty()) {
+                    f->eraseFromParent();
+                }
+            }
+        }
+
+        // Strip OptimizeNone/NoDuplicate from ALL defined functions, not just
+        // __remill_* — semantic handlers inlined into traces may carry these.
+        for (auto& func : *export_module) {
+            if (func.isDeclaration()) continue;
+            func.removeFnAttr(llvm::Attribute::OptimizeNone);
+            func.removeFnAttr(llvm::Attribute::NoDuplicate);
+            if (func.getLinkage() == llvm::GlobalValue::InternalLinkage)
+                func.removeFnAttr(llvm::Attribute::NoInline);
+        }
+
+        spdlog::info("Prepared {} traces for inlining (non-entry internalized)", visited.size() - 1);
+    }
+
+    // 10. Apply optimization passes if requested
+    if (config.opt_level != OptimizationLevel::O0) {
+        spdlog::info("Applying O{} optimization...", static_cast<int>(config.opt_level));
+        IROptimizer optimizer(lifting_service_->context()->arch());
+        optimizer.run_optimization_passes(*export_module, config.opt_level);
     }
 
     llvm::raw_string_ostream os(result.code_ir);
@@ -402,7 +856,9 @@ ExportLiftResult ExportLiftService::compile_and_link(ExportLiftResult& result, c
 
     { std::ofstream(code_ll) << result.code_ir; }
 
-    std::string cmd = std::format("clang -c \"{}\" -o \"{}\" -fno-stack-protector", code_ll.string(), code_obj.string());
+    // IR is already optimized by our pipeline — clang only does codegen.
+    // Use -O0 to avoid re-running the same LLVM passes a second time.
+    std::string cmd = std::format("clang -c \"{}\" -o \"{}\" -O0 -fno-stack-protector", code_ll.string(), code_obj.string());
     if (std::system(cmd.c_str()) != 0) {
         result.compilation_success = false;
         result.compilation_output = "Clang compilation failed.";
@@ -416,7 +872,7 @@ ExportLiftResult ExportLiftService::compile_and_link(ExportLiftResult& result, c
         std::filesystem::path d_ll = temp_dir / (base + "_data.ll");
         std::filesystem::path d_obj = temp_dir / (base + "_data.obj");
         { std::ofstream(d_ll) << result.data_ir; }
-        std::system(std::format("clang -c \"{}\" -o \"{}\"", d_ll.string(), d_obj.string()).c_str());
+        std::system(std::format("clang -c \"{}\" -o \"{}\" -O0", d_ll.string(), d_obj.string()).c_str());
         link_cmd << " \"" << d_obj.string() << "\"";
     }
 

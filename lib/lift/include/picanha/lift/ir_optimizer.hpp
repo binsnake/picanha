@@ -42,8 +42,10 @@ public:
     // Get the IR text of just a specific function
     [[nodiscard]] std::string get_function_ir_text(const llvm::Module& module, const std::string& func_name) const;
 
-private:
+    // Run optimization passes on a module directly
     void run_optimization_passes(llvm::Module& module, OptimizationLevel level);
+
+private:
 
     const remill::Arch* arch_;
 };

@@ -122,11 +122,16 @@ LiftResult LiftingService::lift_function_impl(const analysis::Function& func) {
         // Create the trace lifter
         remill::TraceLifter lifter(context_->arch(), *trace_manager);
 
-        // Lift the function starting at the entry address
+        // Lift the function starting at the entry address.
+        // Filter callback by address so we capture the correct function,
+        // not a recursively-lifted callee at a higher address.
         llvm::Function* lifted_func = nullptr;
-        bool lift_success = lifter.Lift(func.entry_address(),
-            [&lifted_func](uint64_t addr, llvm::Function* fn) {
-                lifted_func = fn;
+        const uint64_t target_addr = func.entry_address();
+        bool lift_success = lifter.Lift(target_addr,
+            [&lifted_func, target_addr](uint64_t addr, llvm::Function* fn) {
+                if (addr == target_addr) {
+                    lifted_func = fn;
+                }
             });
 
         if (!lifted_func) {

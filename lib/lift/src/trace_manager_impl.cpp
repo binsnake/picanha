@@ -1,5 +1,7 @@
 #include <picanha/lift/trace_manager_impl.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <format>
 
 namespace picanha::lift {
@@ -84,6 +86,67 @@ bool PicanhaTraceManager::is_executable(std::uint64_t addr) const {
     }
 
     return false;
+}
+
+void PicanhaTraceManager::ForEachDevirtualizedTarget(
+    const remill::Instruction& inst,
+    std::function<void(uint64_t, remill::DevirtualizedTargetKind)> func)
+{
+    auto targets = analyze_jump_table(inst);
+    for (uint64_t target : targets) {
+        func(target, remill::DevirtualizedTargetKind::kTraceLocal);
+    }
+}
+
+std::vector<uint64_t> PicanhaTraceManager::analyze_jump_table(
+    const remill::Instruction& inst) const
+{
+    std::vector<uint64_t> targets;
+    if (!binary_) return targets;
+
+    // Decode instructions around the indirect jump using picanha's decoder
+    // and delegate to JumpTableAnalyzer which uses DAG/pattern matching
+    const uint64_t scan_window = 128;
+    const uint64_t scan_start = (inst.pc >= scan_window) ? inst.pc - scan_window : 0;
+    const uint64_t scan_end = inst.pc + 15; // max x86 instruction length
+    const uint64_t scan_size = scan_end - scan_start;
+
+    auto code_bytes = binary_->memory().read(scan_start, scan_size);
+    if (!code_bytes || code_bytes->empty()) return targets;
+
+    // Decode all instructions in the scan window
+    disasm::Decoder decoder(binary_->bitness());
+    ByteSpan code_span(*code_bytes);
+    auto instructions = decoder.decode_all(code_span, scan_start);
+    if (instructions.empty()) return targets;
+
+    // Build a basic block for the analyzer
+    analysis::BasicBlock block(0, scan_start);
+    for (const auto& instr : instructions) {
+        block.add_instruction(instr);
+    }
+
+    // Use JumpTableAnalyzer with DAG-based pattern matching
+    analysis::JumpTableConfig config;
+    config.max_entries = 4096;
+    config.min_entries = 2;
+    config.require_bounds_check = false;
+    config.allow_relative_tables = true;
+
+    analysis::JumpTableAnalyzer analyzer(binary_, config);
+    auto result = analyzer.analyze_indirect_jump(
+        block, static_cast<Address>(inst.pc));
+
+    if (result && result->is_valid()) {
+        targets = result->targets;
+        spdlog::info(
+            "Devirtualized indirect jump at 0x{:X}: {} targets "
+            "from table at 0x{:X} ({})",
+            inst.pc, targets.size(), result->table_address,
+            analysis::jump_table_entry_type_name(result->entry_type));
+    }
+
+    return targets;
 }
 
 void PicanhaTraceManager::clear() {

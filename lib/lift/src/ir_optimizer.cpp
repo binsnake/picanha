@@ -30,6 +30,7 @@
 #include <spdlog/spdlog.h>
 
 #include <remill/Arch/Arch.h>
+#include <remill/BC/DeadStoreEliminator.h>
 #include <remill/BC/Optimizer.h>
 
 #include <mutex>
@@ -179,7 +180,19 @@ void IROptimizer::run_optimization_passes(llvm::Module& module, OptimizationLeve
 
     MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
 
+    // Run the pipeline
     MPM.run(module, MAM);
+
+    // Run architecture-aware dead store elimination for state structure
+    // This removes stores to the State structure that are never read
+    try {
+        auto slots = remill::StateSlotsForArch(arch_);
+        if (!slots.empty()) {
+            remill::RemoveDeadStores(arch_, &module, nullptr, slots);
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("DeadStoreEliminator failed: {}", e.what());
+    }
 }
 
 std::string IROptimizer::get_ir_text(const llvm::Module& module) const {

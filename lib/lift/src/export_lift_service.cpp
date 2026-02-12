@@ -12,6 +12,7 @@
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Linker/Linker.h>
@@ -66,6 +67,108 @@ static std::string get_base_name(llvm::StringRef name) {
         return n.substr(0, dot_pos);
     }
     return n;
+}
+
+// --------------------------------------------------------------------------
+// Improved Pointer Resolution for Memory Intrinsics
+// --------------------------------------------------------------------------
+// Handles complex address computations that remill-generated code may use.
+// This is based on McSema's pointer resolution logic.
+
+static llvm::Value* get_pointer_from_address(llvm::IRBuilder<>& builder, llvm::Value* addr,
+                                              llvm::Type* elem_type, unsigned addr_space = 0) {
+    auto& ctx = builder.getContext();
+    auto dest_type = llvm::PointerType::get(elem_type, addr_space);
+    auto addr_type = addr->getType();
+
+    // Handle inttoptr instruction
+    if (auto* itp = llvm::dyn_cast<llvm::IntToPtrInst>(addr)) {
+        llvm::IRBuilder<> sub_builder(itp);
+        return get_pointer_from_address(sub_builder, itp->getOperand(0), elem_type, addr_space);
+    }
+
+    // Handle ptrtoint - go back to the pointer operand
+    if (auto* pti = llvm::dyn_cast<llvm::PtrToIntOperator>(addr)) {
+        return get_pointer_from_address(builder, pti->getPointerOperand(), elem_type, addr_space);
+    }
+
+    // Already a pointer of the right type
+    if (addr_type == dest_type) {
+        return addr;
+    }
+
+    // Handle constant integers - try to convert to pointer
+    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(addr)) {
+        return llvm::ConstantExpr::getIntToPtr(ci, dest_type);
+    }
+
+    // Handle constant expressions
+    if (auto* ce = llvm::dyn_cast<llvm::ConstantExpr>(addr)) {
+        if (ce->getOpcode() == llvm::Instruction::IntToPtr) {
+            return get_pointer_from_address(builder, ce->getOperand(0), elem_type, addr_space);
+        } else if (addr_type->isIntegerTy()) {
+            return llvm::ConstantExpr::getIntToPtr(ce, dest_type);
+        }
+    }
+
+    // Handle Add operations - try to find pointer and compute offset
+    if (auto* add = llvm::dyn_cast<llvm::AddOperator>(addr)) {
+        llvm::Value* lhs_op = add->getOperand(0);
+        llvm::Value* rhs_op = add->getOperand(1);
+
+        llvm::Value* lhs = get_pointer_from_address(builder, lhs_op, elem_type, addr_space);
+        llvm::Value* rhs = get_pointer_from_address(builder, rhs_op, elem_type, addr_space);
+
+        if (lhs && rhs) {
+            spdlog::warn("get_pointer_from_address: both operands are pointers in add");
+            return builder.CreateIntToPtr(addr, dest_type);
+        }
+
+        if (rhs) {
+            // Indexed pointer access
+            auto* i32_ty = llvm::Type::getInt32Ty(ctx);
+            llvm::Value* indices[1] = {builder.CreateTrunc(rhs_op, i32_ty)};
+            auto* base = llvm::cast<llvm::Value>(builder.CreateBitCast(rhs, llvm::PointerType::get(elem_type, addr_space)));
+            return builder.CreateGEP(elem_type, base, indices);
+        } else if (lhs) {
+            auto* i32_ty = llvm::Type::getInt32Ty(ctx);
+            llvm::Value* indices[1] = {builder.CreateTrunc(rhs_op, i32_ty)};
+            auto* base = llvm::cast<llvm::Value>(builder.CreateBitCast(lhs, llvm::PointerType::get(elem_type, addr_space)));
+            return builder.CreateGEP(elem_type, base, indices);
+        }
+    }
+
+    // Handle Sub operations
+    if (auto* sub = llvm::dyn_cast<llvm::SubOperator>(addr)) {
+        llvm::Value* lhs_op = sub->getOperand(0);
+        llvm::Value* rhs_op = sub->getOperand(1);
+        auto* rhs = llvm::dyn_cast<llvm::ConstantInt>(rhs_op);
+
+        if (auto* lhs = get_pointer_from_address(builder, lhs_op, elem_type, addr_space)) {
+            if (rhs) {
+                // Subtract constant offset
+                auto i32_ty = llvm::Type::getInt32Ty(ctx);
+                auto neg_offset = static_cast<int64_t>(-static_cast<int32_t>(rhs->getZExtValue()));
+                auto const_index = llvm::ConstantInt::get(i32_ty, static_cast<uint64_t>(neg_offset), true);
+                llvm::Value* indices[1] = {const_index};
+                auto* base = llvm::cast<llvm::Value>(builder.CreateBitCast(lhs, llvm::PointerType::get(elem_type, addr_space)));
+                return builder.CreateGEP(elem_type, base, indices);
+            }
+        }
+    }
+
+    // Handle BitCast operations
+    if (auto* bc = llvm::dyn_cast<llvm::BitCastOperator>(addr)) {
+        return get_pointer_from_address(builder, bc->getOperand(0), elem_type, addr_space);
+    }
+
+    // Handle global values
+    if (llvm::isa<llvm::GlobalValue>(addr)) {
+        return builder.CreateBitCast(addr, dest_type);
+    }
+
+    // Fallback: inttoptr
+    return builder.CreateIntToPtr(addr, dest_type);
 }
 
 // --------------------------------------------------------------------------
@@ -200,7 +303,7 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                     // Signature: rettype (ptr %mem, i64 %addr)
                     llvm::Value* addr = call->getArgOperand(1);
                     llvm::Type* ret_ty = call->getType();
-                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(ret_ty));
+                    auto* ptr = get_pointer_from_address(builder, addr, ret_ty, 0);
                     auto* val = builder.CreateAlignedLoad(ret_ty, ptr, llvm::MaybeAlign(1));
                     call->replaceAllUsesWith(val);
                     to_erase.push_back(call);
@@ -209,7 +312,7 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                          cname == "__remill_read_memory_f128") {
                     llvm::Value* addr = call->getArgOperand(1);
                     llvm::Type* ret_ty = call->getType();
-                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(ret_ty));
+                    auto* ptr = get_pointer_from_address(builder, addr, ret_ty, 0);
                     auto* val = builder.CreateAlignedLoad(ret_ty, ptr, llvm::MaybeAlign(1));
                     call->replaceAllUsesWith(val);
                     to_erase.push_back(call);
@@ -219,7 +322,7 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                     llvm::Value* addr = call->getArgOperand(1);
                     llvm::Value* ref = call->getArgOperand(2);
                     auto* fp80_ty = llvm::Type::getX86_FP80Ty(ctx);
-                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(fp80_ty));
+                    auto* ptr = get_pointer_from_address(builder, addr, fp80_ty, 0);
                     auto* val = builder.CreateAlignedLoad(fp80_ty, ptr, llvm::MaybeAlign(1));
                     builder.CreateStore(val, ref);
                     call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
@@ -231,7 +334,7 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                     // Signature: ptr (ptr %mem, i64 %addr, valtype %val)
                     llvm::Value* addr = call->getArgOperand(1);
                     llvm::Value* val = call->getArgOperand(2);
-                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(val->getType()));
+                    auto* ptr = get_pointer_from_address(builder, addr, val->getType(), 0);
                     builder.CreateAlignedStore(val, ptr, llvm::MaybeAlign(1));
                     call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
                     to_erase.push_back(call);
@@ -240,7 +343,7 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                          cname == "__remill_write_memory_f128") {
                     llvm::Value* addr = call->getArgOperand(1);
                     llvm::Value* val = call->getArgOperand(2);
-                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(val->getType()));
+                    auto* ptr = get_pointer_from_address(builder, addr, val->getType(), 0);
                     builder.CreateAlignedStore(val, ptr, llvm::MaybeAlign(1));
                     call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
                     to_erase.push_back(call);
@@ -250,7 +353,7 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                     llvm::Value* addr = call->getArgOperand(1);
                     llvm::Value* ref = call->getArgOperand(2);
                     auto* fp80_ty = llvm::Type::getX86_FP80Ty(ctx);
-                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(fp80_ty));
+                    auto* ptr = get_pointer_from_address(builder, addr, fp80_ty, 0);
                     auto* val = builder.CreateAlignedLoad(fp80_ty, ref, llvm::MaybeAlign(1));
                     builder.CreateAlignedStore(val, ptr, llvm::MaybeAlign(1));
                     call->replaceAllUsesWith(call->getArgOperand(0)); // return %mem
@@ -290,7 +393,7 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                     llvm::Value* desired = call->getArgOperand(3);
 
                     llvm::Type* val_ty = desired->getType();
-                    auto* ptr = builder.CreateIntToPtr(addr, llvm::PointerType::getUnqual(val_ty));
+                    auto* ptr = get_pointer_from_address(builder, addr, val_ty, 0);
 
                     // Non-atomic lowering: load old, compare, conditionally store
                     auto* old_val = builder.CreateAlignedLoad(val_ty, ptr, llvm::MaybeAlign(1));
@@ -303,6 +406,88 @@ static void lower_remill_intrinsics(llvm::Module& module) {
                     builder.CreateAlignedStore(old_val, expected_ref, llvm::MaybeAlign(1));
 
                     call->replaceAllUsesWith(mem);
+                    to_erase.push_back(call);
+                }
+                // --- Fetch and add ---
+                else if (cname.starts_with("__remill_fetch_and_add_")) {
+                    // Signature: ptr (ptr %mem, i64 %addr, valtype %val) -> valtype
+                    llvm::Value* mem = call->getArgOperand(0);
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* val = call->getArgOperand(2);
+
+                    llvm::Type* val_ty = val->getType();
+                    auto* ptr = get_pointer_from_address(builder, addr, val_ty, 0);
+
+                    // Non-atomic lowering: load old, add, store new, return old
+                    auto* old_val = builder.CreateAlignedLoad(val_ty, ptr, llvm::MaybeAlign(1));
+                    auto* new_val = builder.CreateAdd(old_val, val);
+                    builder.CreateAlignedStore(new_val, ptr, llvm::MaybeAlign(1));
+
+                    call->replaceAllUsesWith(old_val);
+                    to_erase.push_back(call);
+                }
+                // --- Fetch and sub ---
+                else if (cname.starts_with("__remill_fetch_and_sub_")) {
+                    llvm::Value* mem = call->getArgOperand(0);
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* val = call->getArgOperand(2);
+
+                    llvm::Type* val_ty = val->getType();
+                    auto* ptr = get_pointer_from_address(builder, addr, val_ty, 0);
+
+                    auto* old_val = builder.CreateAlignedLoad(val_ty, ptr, llvm::MaybeAlign(1));
+                    auto* new_val = builder.CreateSub(old_val, val);
+                    builder.CreateAlignedStore(new_val, ptr, llvm::MaybeAlign(1));
+
+                    call->replaceAllUsesWith(old_val);
+                    to_erase.push_back(call);
+                }
+                // --- Fetch and and ---
+                else if (cname.starts_with("__remill_fetch_and_and_")) {
+                    llvm::Value* mem = call->getArgOperand(0);
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* val = call->getArgOperand(2);
+
+                    llvm::Type* val_ty = val->getType();
+                    auto* ptr = get_pointer_from_address(builder, addr, val_ty, 0);
+
+                    auto* old_val = builder.CreateAlignedLoad(val_ty, ptr, llvm::MaybeAlign(1));
+                    auto* new_val = builder.CreateAnd(old_val, val);
+                    builder.CreateAlignedStore(new_val, ptr, llvm::MaybeAlign(1));
+
+                    call->replaceAllUsesWith(old_val);
+                    to_erase.push_back(call);
+                }
+                // --- Fetch and or ---
+                else if (cname.starts_with("__remill_fetch_and_or_")) {
+                    llvm::Value* mem = call->getArgOperand(0);
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* val = call->getArgOperand(2);
+
+                    llvm::Type* val_ty = val->getType();
+                    auto* ptr = get_pointer_from_address(builder, addr, val_ty, 0);
+
+                    auto* old_val = builder.CreateAlignedLoad(val_ty, ptr, llvm::MaybeAlign(1));
+                    auto* new_val = builder.CreateOr(old_val, val);
+                    builder.CreateAlignedStore(new_val, ptr, llvm::MaybeAlign(1));
+
+                    call->replaceAllUsesWith(old_val);
+                    to_erase.push_back(call);
+                }
+                // --- Fetch and xor ---
+                else if (cname.starts_with("__remill_fetch_and_xor_")) {
+                    llvm::Value* mem = call->getArgOperand(0);
+                    llvm::Value* addr = call->getArgOperand(1);
+                    llvm::Value* val = call->getArgOperand(2);
+
+                    llvm::Type* val_ty = val->getType();
+                    auto* ptr = get_pointer_from_address(builder, addr, val_ty, 0);
+
+                    auto* old_val = builder.CreateAlignedLoad(val_ty, ptr, llvm::MaybeAlign(1));
+                    auto* new_val = builder.CreateXor(old_val, val);
+                    builder.CreateAlignedStore(new_val, ptr, llvm::MaybeAlign(1));
+
+                    call->replaceAllUsesWith(old_val);
                     to_erase.push_back(call);
                 }
                 // --- I/O port reads ---
@@ -432,6 +617,90 @@ static void lower_remill_intrinsics(llvm::Module& module) {
         if (!func.getArg(2)->hasAttribute(llvm::Attribute::NoAlias))
             func.getArg(2)->addAttr(llvm::Attribute::NoAlias);
     }
+}
+
+// --------------------------------------------------------------------------
+// TBAA Metadata Annotation
+// --------------------------------------------------------------------------
+// Adds Type-Based Alias Analysis metadata to separate State struct accesses
+// from program memory accesses. After intrinsic lowering, memory reads/writes
+// become inttoptr-derived loads/stores, while State accesses go through GEP
+// chains from function arguments. LLVM's BasicAA is conservative with inttoptr
+// (returns MayAlias), so we use TBAA to explicitly tell LLVM these two domains
+// cannot alias, enabling DSE to eliminate dead State stores.
+
+static void annotate_tbaa_metadata(llvm::Module& module) {
+    auto& ctx = module.getContext();
+    llvm::MDBuilder md_builder(ctx);
+
+    // Create TBAA type hierarchy:
+    //   "Remill TBAA" (root)
+    //     ├── "Remill State" (State struct accesses)
+    //     └── "Program Memory" (inttoptr-derived accesses)
+    // Since these are sibling types under the same root, TBAA proves NoAlias.
+    auto* tbaa_root = md_builder.createTBAARoot("Remill TBAA");
+    auto* tbaa_state = md_builder.createTBAAScalarTypeNode("Remill State", tbaa_root);
+    auto* tbaa_mem = md_builder.createTBAAScalarTypeNode("Program Memory", tbaa_root);
+
+    // Create access tags (type, access type, offset)
+    auto* state_tag = md_builder.createTBAAStructTagNode(tbaa_state, tbaa_state, 0);
+    auto* mem_tag = md_builder.createTBAAStructTagNode(tbaa_mem, tbaa_mem, 0);
+
+    // Helper: walk a pointer backwards through GEP/BitCast/AddrSpaceCast to
+    // determine if it originates from a function Argument (State-derived).
+    // Returns true for arg-derived, false otherwise. Conservative: stops at
+    // PHI/Select/Call boundaries.
+    auto is_arg_derived = [](llvm::Value* v) -> bool {
+        llvm::SmallPtrSet<llvm::Value*, 8> visited;
+        while (v) {
+            if (!visited.insert(v).second) return false; // cycle
+            if (llvm::isa<llvm::Argument>(v)) return true;
+            if (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(v)) {
+                v = gep->getPointerOperand();
+            } else if (auto* bc = llvm::dyn_cast<llvm::BitCastInst>(v)) {
+                v = bc->getOperand(0);
+            } else if (auto* asc = llvm::dyn_cast<llvm::AddrSpaceCastInst>(v)) {
+                v = asc->getPointerOperand();
+            } else {
+                return false; // PHI, Select, Call, alloca, etc. — conservative
+            }
+        }
+        return false;
+    };
+
+    unsigned state_count = 0;
+    unsigned mem_count = 0;
+
+    for (auto& func : module.functions()) {
+        if (func.isDeclaration()) continue;
+
+        for (auto& bb : func) {
+            for (auto& inst : bb) {
+                llvm::Value* ptr = nullptr;
+
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(&inst)) {
+                    ptr = load->getPointerOperand();
+                } else if (auto* store = llvm::dyn_cast<llvm::StoreInst>(&inst)) {
+                    ptr = store->getPointerOperand();
+                } else {
+                    continue;
+                }
+
+                // Classify: inttoptr → Program Memory, arg-derived → State
+                if (llvm::isa<llvm::IntToPtrInst>(ptr)) {
+                    inst.setMetadata(llvm::LLVMContext::MD_tbaa, mem_tag);
+                    mem_count++;
+                } else if (is_arg_derived(ptr)) {
+                    inst.setMetadata(llvm::LLVMContext::MD_tbaa, state_tag);
+                    state_count++;
+                }
+                // else: unclassifiable (alloca, PHI-derived, etc.) — leave untagged (conservative MayAlias)
+            }
+        }
+    }
+
+    spdlog::info("annotate_tbaa_metadata: tagged {} State accesses, {} program memory accesses",
+                 state_count, mem_count);
 }
 
 static void generate_runtime_stubs(llvm::Module& module) {
@@ -731,6 +1000,9 @@ ExportLiftResult ExportLiftService::export_function(Address entry, const ExportL
     // 6. Lower remill intrinsics to native operations
     lower_remill_intrinsics(*export_module);
 
+    // 6b. Annotate TBAA metadata to separate State and program memory domains
+    annotate_tbaa_metadata(*export_module);
+
     // 7. Generate stubs for any remaining intrinsics
     generate_runtime_stubs(*export_module);
 
@@ -858,7 +1130,8 @@ ExportLiftResult ExportLiftService::compile_and_link(ExportLiftResult& result, c
 
     // IR is already optimized by our pipeline — clang only does codegen.
     // Use -O0 to avoid re-running the same LLVM passes a second time.
-    std::string cmd = std::format("clang -c \"{}\" -o \"{}\" -O0 -fno-stack-protector", code_ll.string(), code_obj.string());
+    // -g -gcodeview emits CodeView debug info for PDB generation during linking.
+    std::string cmd = std::format("clang -c \"{}\" -o \"{}\" -O0 -fno-stack-protector -g -gcodeview", code_ll.string(), code_obj.string());
     if (std::system(cmd.c_str()) != 0) {
         result.compilation_success = false;
         result.compilation_output = "Clang compilation failed.";
@@ -872,7 +1145,7 @@ ExportLiftResult ExportLiftService::compile_and_link(ExportLiftResult& result, c
         std::filesystem::path d_ll = temp_dir / (base + "_data.ll");
         std::filesystem::path d_obj = temp_dir / (base + "_data.obj");
         { std::ofstream(d_ll) << result.data_ir; }
-        std::system(std::format("clang -c \"{}\" -o \"{}\" -O0", d_ll.string(), d_obj.string()).c_str());
+        std::system(std::format("clang -c \"{}\" -o \"{}\" -O0 -g -gcodeview", d_ll.string(), d_obj.string()).c_str());
         link_cmd << " \"" << d_obj.string() << "\"";
     }
 
@@ -885,6 +1158,7 @@ ExportLiftResult ExportLiftService::compile_and_link(ExportLiftResult& result, c
     }
 
     if (!config.entry_point_name.empty()) link_cmd << " -Wl,/ENTRY:" << config.entry_point_name;
+    link_cmd << " -Wl,/DEBUG";
     link_cmd << " -lkernel32 -luser32 -lshell32 -lucrt -lvcruntime -lmsvcrt -o \"" << output_exe.string() << "\"";
 
     int ret = std::system(link_cmd.str().c_str());

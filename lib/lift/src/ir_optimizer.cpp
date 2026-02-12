@@ -20,11 +20,19 @@
 #include <llvm/Analysis/CGSCCPassManager.h>
 #include <llvm/Analysis/LoopAnalysisManager.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/OptimizationLevel.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/Target/TargetMachine.h>
+
+#include <spdlog/spdlog.h>
 
 #include <remill/Arch/Arch.h>
 #include <remill/BC/Optimizer.h>
+
+#include <mutex>
 
 namespace picanha::lift {
 
@@ -73,45 +81,104 @@ std::unique_ptr<llvm::Module> IROptimizer::clone_and_optimize(
     }
 }
 
+static std::once_flag s_target_init_flag;
+
+static llvm::TargetMachine* create_target_machine(const llvm::Module& module) {
+    std::call_once(s_target_init_flag, [] {
+        LLVMInitializeX86TargetInfo();
+        LLVMInitializeX86Target();
+        LLVMInitializeX86TargetMC();
+        LLVMInitializeX86AsmPrinter();
+        LLVMInitializeX86AsmParser();
+    });
+
+    auto triple = module.getTargetTriple();
+    if (triple.empty()) triple = "x86_64-pc-windows-msvc";
+
+    std::string error;
+    auto* target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target) {
+        spdlog::warn("Could not look up target for '{}': {}", triple, error);
+        return nullptr;
+    }
+
+    return target->createTargetMachine(
+        triple, "generic", "",
+        llvm::TargetOptions(), std::nullopt);
+}
+
 void IROptimizer::run_optimization_passes(llvm::Module& module, OptimizationLevel level) {
     if (level == OptimizationLevel::O0) {
-        // No optimization
         return;
     }
 
-    // Use LLVM's new pass manager
+    // Create a TargetMachine so PassBuilder registers TargetTransformInfo (TTI)
+    // and TargetLibraryInfo (TLI). Without these, LLVM's cost models are overly
+    // conservative and DSE/GVN/inlining produce significantly worse code.
+    std::unique_ptr<llvm::TargetMachine> TM(create_target_machine(module));
+    if (TM) {
+        module.setDataLayout(TM->createDataLayout());
+        spdlog::info("Optimizer: using TargetMachine for triple '{}', data layout '{}'",
+                     module.getTargetTriple(), module.getDataLayoutStr());
+    } else {
+        spdlog::warn("Optimizer: no TargetMachine — optimization will be degraded");
+    }
+
     llvm::LoopAnalysisManager LAM;
     llvm::FunctionAnalysisManager FAM;
     llvm::CGSCCAnalysisManager CGAM;
     llvm::ModuleAnalysisManager MAM;
 
-    llvm::PassBuilder PB;
+    llvm::PassBuilder PB(TM.get());
 
-    // Register analysis passes
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);
     PB.registerLoopAnalyses(LAM);
     PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-    // Get the optimization pipeline based on level
+    // McSema-style optimization pipeline for lifted bitcode
+    // This ordering is tuned for remill-generated IR
     llvm::ModulePassManager MPM;
 
+    // Build the pipeline based on optimization level
+    llvm::OptimizationLevel opt_level;
     switch (level) {
         case OptimizationLevel::O1:
-            MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O1);
+            opt_level = llvm::OptimizationLevel::O1;
             break;
         case OptimizationLevel::O2:
-            MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+            opt_level = llvm::OptimizationLevel::O2;
             break;
         case OptimizationLevel::O3:
-            MPM = PB.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+            opt_level = llvm::OptimizationLevel::O3;
             break;
         default:
             return;
     }
 
-    // Run the optimization pipeline
+    // Use the standard pipeline but with additional scalar optimizations
+    // that are particularly useful for lifted code
+    MPM = PB.buildPerModuleDefaultPipeline(opt_level);
+
+    // Add additional passes after the standard pipeline that help with lifted code
+    // These target common patterns in remill-generated IR
+    
+    // Run function-level optimizations to clean up after the module pipeline
+    llvm::FunctionPassManager FPM;
+    FPM.addPass(llvm::createEarlyCSEPass(true));           // Common subexpression elimination
+    FPM.addPass(llvm::createDeadCodeEliminationPass());     // Dead code elimination
+    FPM.addPass(llvm::createSinkingPass());                // Move instructions down
+    FPM.addPass(llvm::createGVNPass());                    // Global value numbering
+    FPM.addPass(llvm::createEarlyCSEPass(true));           // CSE after GVN
+    FPM.addPass(llvm::createSROAPass());                    // Scalar replacement of aggregates
+    FPM.addPass(llvm::createPromoteMemoryToRegisterPass()); // Mem2reg
+    FPM.addPass(llvm::createCFGSimplificationPass());       // Simplify CFG
+    FPM.addPass(llvm::createSinkingPass());                // Sink again after simplifications
+    FPM.addPass(llvm::createCFGSimplificationPass());       // Simplify CFG again
+
+    MPM.addPass(llvm::createModuleToFunctionPassAdaptor(std::move(FPM)));
+
     MPM.run(module, MAM);
 }
 

@@ -413,3 +413,5 @@ compile_commands.json
 
 # vcpkg
 vcpkg_installed/
+.claude/settings.local.json
+/mcsema-master

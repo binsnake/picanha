@@ -3,7 +3,25 @@
     "allow": [
       "Bash(ls -la \"D:\\\\binsnake\\\\picanha\\\\lib\\\\loader\"\" 2>/dev/null || echo \"Directory may not exist \")",
       "Bash(cmake --build:*)",
-      "Bash(ninja:*)"
+      "Bash(ninja:*)",
+      "Bash(find:*)",
+      "Bash(python3:*)",
+      "Bash(opt --version:*)",
+      "Bash(ls:*)",
+      "Bash(\"D:/binsnake/picanha/remill/dependencies/install/bin/llvm-config\" --version)",
+      "Bash(\"D:/binsnake/picanha/remill/dependencies/install/bin/opt\" -O3 \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/output.ll\" -o \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/optimized17.bc\")",
+      "Bash(\"D:/binsnake/picanha/remill/dependencies/install/bin/llvm-dis\" \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/optimized17.bc\" -o \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/optimized17.ll\")",
+      "Bash(\"D:/binsnake/picanha/remill/dependencies/install/bin/opt\" -O3 \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/output.ll\" -S -o \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/opt_check.ll\")",
+      "Bash(\"D:/binsnake/picanha/build/qt-llvm-release/bin/picanha.exe\":*)",
+      "Bash(\"D:/binsnake/picanha/build/qt-llvm-release/bin/picanha.exe\" export-lift --help)",
+      "Bash(./picanha.exe export-lift:*)",
+      "Bash(\"D:/binsnake/picanha/remill/dependencies/install/bin/opt\" -O3 \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/opt_check.ll\" -S -o \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/opt_check2.ll\")",
+      "Bash(\"D:/binsnake/picanha/remill/dependencies/install/bin/opt\" -O3 \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/pre_opt.ll\" -S -o \"C:/Users/ricoc/AppData/Local/Temp/picanha_export/opt_from_preopt.ll\")",
+      "Bash(clang:*)",
+      "Bash(python -c \" import subprocess, re result = subprocess.run\\([''dumpbin'', ''/dependents'', ''bin/picanha-gui.exe''], capture_output=True, text=True\\) print\\(result.stdout[-2000:] if len\\(result.stdout\\) > 2000 else result.stdout\\) print\\(result.stderr[-500:] if result.stderr else ''''\\) \")",
+      "Bash(objdump:*)",
+      "Bash(ldd:*)",
+      "Bash(cmake:*)"
     ]
   }
 }
